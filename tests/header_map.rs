@@ -114,8 +114,7 @@ fn drain_drop_immediately() {
     headers.insert("zomg", "bar".parse().unwrap());
     headers.append("hello", "world2".parse().unwrap());
 
-    let iter = headers.drain();
-    assert_eq!(iter.size_hint(), (2, Some(3)));
+    let _ = headers.drain();
     // not consuming `iter`
 }
 
@@ -131,7 +130,6 @@ fn drain_forget() {
 
     {
         let mut iter = headers.drain();
-        assert_eq!(iter.size_hint(), (2, Some(2)));
         let _ = iter.next().unwrap();
         std::mem::forget(iter);
     }

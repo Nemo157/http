@@ -1,15 +1,14 @@
-use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
+use std::collections::{hash_map, HashMap};
 use std::convert::TryFrom;
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::iter::{FromIterator, FusedIterator};
+use std::hash::Hash;
+use std::iter::{self, FromIterator, FusedIterator};
+use std::{fmt, ops, vec, slice};
 use std::marker::PhantomData;
-use std::{fmt, mem, ops, ptr, vec};
 
 use crate::Error;
 
 use super::HeaderValue;
-use super::name::{HdrName, HeaderName, InvalidHeaderName};
+use super::name::{HeaderName, InvalidHeaderName};
 
 pub use self::as_header_name::AsHeaderName;
 pub use self::into_header_name::IntoHeaderName;
@@ -43,38 +42,8 @@ pub use self::into_header_name::IntoHeaderName;
 /// ```
 #[derive(Clone)]
 pub struct HeaderMap<T = HeaderValue> {
-    // Used to mask values to get an index
-    mask: Size,
-    indices: Box<[Pos]>,
-    entries: Vec<Bucket<T>>,
-    extra_values: Vec<ExtraValue<T>>,
-    danger: Danger,
+    map: HashMap<HeaderName, Vec<T>>,
 }
-
-// # Implementation notes
-//
-// Below, you will find a fairly large amount of code. Most of this is to
-// provide the necessary functions to efficiently manipulate the header
-// multimap. The core hashing table is based on robin hood hashing [1]. While
-// this is the same hashing algorithm used as part of Rust's `HashMap` in
-// stdlib, many implementation details are different. The two primary reasons
-// for this divergence are that `HeaderMap` is a multimap and the structure has
-// been optimized to take advantage of the characteristics of HTTP headers.
-//
-// ## Structure Layout
-//
-// Most of the data contained by `HeaderMap` is *not* stored in the hash table.
-// Instead, pairs of header name and *first* associated header value are stored
-// in the `entries` vector. If the header name has more than one associated
-// header value, then additional values are stored in `extra_values`. The actual
-// hash table (`indices`) only maps hash codes to indices in `entries`. This
-// means that, when an eviction happens, the actual header name and value stay
-// put and only a tiny amount of memory has to be copied.
-//
-// Extra values associated with a header name are tracked using a linked list.
-// Links are formed with offsets into `extra_values` and not pointers.
-//
-// [1]: https://en.wikipedia.org/wiki/Hash_table#Robin_Hood_hashing
 
 /// `HeaderMap` entry iterator.
 ///
@@ -82,7 +51,7 @@ pub struct HeaderMap<T = HeaderValue> {
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct Iter<'a, T> {
-    inner: IterMut<'a, T>,
+    inner: iter::FlatMap<hash_map::Iter<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>, fn((&'a HeaderName, &'a Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>>,
 }
 
 /// `HeaderMap` mutable entry iterator
@@ -91,10 +60,7 @@ pub struct Iter<'a, T> {
 /// yielded more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct IterMut<'a, T> {
-    map: *mut HeaderMap<T>,
-    entry: usize,
-    cursor: Option<Cursor>,
-    lt: PhantomData<&'a mut HeaderMap<T>>,
+    inner: iter::FlatMap<hash_map::IterMut<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>, fn((&'a HeaderName, &'a mut Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>>,
 }
 
 /// An owning iterator over the entries of a `HeaderMap`.
@@ -102,10 +68,7 @@ pub struct IterMut<'a, T> {
 /// This struct is created by the `into_iter` method on `HeaderMap`.
 #[derive(Debug)]
 pub struct IntoIter<T> {
-    // If None, pull from `entries`
-    next: Option<usize>,
-    entries: vec::IntoIter<Bucket<T>>,
-    extra_values: Vec<ExtraValue<T>>,
+    inner: iter::FlatMap<hash_map::IntoIter<HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
 }
 
 /// An iterator over `HeaderMap` keys.
@@ -114,7 +77,7 @@ pub struct IntoIter<T> {
 /// associated value.
 #[derive(Debug)]
 pub struct Keys<'a, T> {
-    inner: ::std::slice::Iter<'a, Bucket<T>>,
+    inner: hash_map::Keys<'a, HeaderName, Vec<T>>,
 }
 
 /// `HeaderMap` value iterator.
@@ -122,25 +85,19 @@ pub struct Keys<'a, T> {
 /// Each value contained in the `HeaderMap` will be yielded.
 #[derive(Debug)]
 pub struct Values<'a, T> {
-    inner: Iter<'a, T>,
+    inner: iter::Flatten<hash_map::Values<'a, HeaderName, Vec<T>>>,
 }
 
 /// `HeaderMap` mutable value iterator
 #[derive(Debug)]
 pub struct ValuesMut<'a, T> {
-    inner: IterMut<'a, T>,
+    inner: iter::Flatten<hash_map::ValuesMut<'a, HeaderName, Vec<T>>>,
 }
 
 /// A drain iterator for `HeaderMap`.
 #[derive(Debug)]
 pub struct Drain<'a, T> {
-    idx: usize,
-    len: usize,
-    entries: *mut [Bucket<T>],
-    // If None, pull from `entries`
-    next: Option<usize>,
-    extra_values: *mut Vec<ExtraValue<T>>,
-    lt: PhantomData<&'a mut HeaderMap<T>>,
+    inner: iter::FlatMap<hash_map::Drain<'a, HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
 }
 
 /// A view to all values stored in a single entry.
@@ -148,8 +105,7 @@ pub struct Drain<'a, T> {
 /// This struct is returned by `HeaderMap::get_all`.
 #[derive(Debug)]
 pub struct GetAll<'a, T> {
-    map: &'a HeaderMap<T>,
-    index: Option<usize>,
+    values: &'a [T],
 }
 
 /// A view into a single location in a `HeaderMap`, which may be vacant or occupied.
@@ -167,11 +123,7 @@ pub enum Entry<'a, T: 'a> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct VacantEntry<'a, T> {
-    map: &'a mut HeaderMap<T>,
-    key: HeaderName,
-    hash: HashValue,
-    probe: usize,
-    danger: bool,
+    inner: hash_map::VacantEntry<'a, HeaderName, Vec<T>>,
 }
 
 /// A view into a single occupied location in a `HeaderMap`.
@@ -179,45 +131,27 @@ pub struct VacantEntry<'a, T> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct OccupiedEntry<'a, T> {
-    map: &'a mut HeaderMap<T>,
-    probe: usize,
+    inner: hash_map::OccupiedEntry<'a, HeaderName, Vec<T>>,
     index: usize,
 }
 
 /// An iterator of all values associated with a single header name.
 #[derive(Debug)]
 pub struct ValueIter<'a, T> {
-    map: &'a HeaderMap<T>,
-    index: usize,
-    front: Option<Cursor>,
-    back: Option<Cursor>,
+    inner: slice::Iter<'a, T>,
 }
 
 /// A mutable iterator of all values associated with a single header name.
 #[derive(Debug)]
 pub struct ValueIterMut<'a, T> {
-    map: *mut HeaderMap<T>,
-    index: usize,
-    front: Option<Cursor>,
-    back: Option<Cursor>,
-    lt: PhantomData<&'a mut HeaderMap<T>>,
+    inner: slice::IterMut<'a, T>,
 }
 
 /// An drain iterator of all values associated with a single header name.
 #[derive(Debug)]
 pub struct ValueDrain<'a, T> {
-    raw_links: RawLinks<T>,
-    extra_values: *mut Vec<ExtraValue<T>>,
-    first: Option<T>,
-    next: Option<usize>,
-    lt: PhantomData<&'a mut HeaderMap<T>>,
-}
-
-/// Tracks the value iterator state
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum Cursor {
-    Head,
-    Values(usize),
+    inner: vec::IntoIter<T>,
+    _marker: PhantomData<&'a mut HeaderMap>,
 }
 
 /// Type used for representing the size of a HeaderMap value.
@@ -236,194 +170,6 @@ type Size = usize;
 
 /// This limit falls out from above.
 const MAX_SIZE: usize = (1 << 15);
-
-/// An entry in the hash table. This represents the full hash code for an entry
-/// as well as the position of the entry in the `entries` vector.
-#[derive(Copy, Clone)]
-struct Pos {
-    // Index in the `entries` vec
-    index: Size,
-    // Full hash value for the entry.
-    hash: HashValue,
-}
-
-/// Hash values are limited to u16 as well. While `fast_hash` and `Hasher`
-/// return `usize` hash codes, limiting the effective hash code to the lower 16
-/// bits is fine since we know that the `indices` vector will never grow beyond
-/// that size.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct HashValue(usize);
-
-/// Stores the data associated with a `HeaderMap` entry. Only the first value is
-/// included in this struct. If a header name has more than one associated
-/// value, all extra values are stored in the `extra_values` vector. A doubly
-/// linked list of entries is maintained. The doubly linked list is used so that
-/// removing a value is constant time. This also has the nice property of
-/// enabling double ended iteration.
-#[derive(Debug, Clone)]
-struct Bucket<T> {
-    hash: HashValue,
-    key: HeaderName,
-    value: T,
-    links: Option<Links>,
-}
-
-/// The head and tail of the value linked list.
-#[derive(Debug, Copy, Clone)]
-struct Links {
-    next: usize,
-    tail: usize,
-}
-
-/// Access to the `links` value in a slice of buckets.
-///
-/// It's important that no other field is accessed, since it may have been
-/// freed in a `Drain` iterator.
-#[derive(Debug)]
-struct RawLinks<T>(*mut [Bucket<T>]);
-
-/// Node in doubly-linked list of header value entries
-#[derive(Debug, Clone)]
-struct ExtraValue<T> {
-    value: T,
-    prev: Link,
-    next: Link,
-}
-
-/// A header value node is either linked to another node in the `extra_values`
-/// list or it points to an entry in `entries`. The entry in `entries` is the
-/// start of the list and holds the associated header name.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum Link {
-    Entry(usize),
-    Extra(usize),
-}
-
-/// Tracks the header map danger level! This relates to the adaptive hashing
-/// algorithm. A HeaderMap starts in the "green" state, when a large number of
-/// collisions are detected, it transitions to the yellow state. At this point,
-/// the header map will either grow and switch back to the green state OR it
-/// will transition to the red state.
-///
-/// When in the red state, a safe hashing algorithm is used and all values in
-/// the header map have to be rehashed.
-#[derive(Clone)]
-enum Danger {
-    Green,
-    Yellow,
-    Red(RandomState),
-}
-
-// Constants related to detecting DOS attacks.
-//
-// Displacement is the number of entries that get shifted when inserting a new
-// value. Forward shift is how far the entry gets stored from the ideal
-// position.
-//
-// The current constant values were picked from another implementation. It could
-// be that there are different values better suited to the header map case.
-const DISPLACEMENT_THRESHOLD: usize = 128;
-const FORWARD_SHIFT_THRESHOLD: usize = 512;
-
-// The default strategy for handling the yellow danger state is to increase the
-// header map capacity in order to (hopefully) reduce the number of collisions.
-// If growing the hash map would cause the load factor to drop bellow this
-// threshold, then instead of growing, the headermap is switched to the red
-// danger state and safe hashing is used instead.
-const LOAD_FACTOR_THRESHOLD: f32 = 0.2;
-
-// Macro used to iterate the hash table starting at a given point, looping when
-// the end is hit.
-macro_rules! probe_loop {
-    ($label:tt: $probe_var: ident < $len: expr, $body: expr) => {
-        debug_assert!($len > 0);
-        $label:
-        loop {
-            if $probe_var < $len {
-                $body
-                $probe_var += 1;
-            } else {
-                $probe_var = 0;
-            }
-        }
-    };
-    ($probe_var: ident < $len: expr, $body: expr) => {
-        debug_assert!($len > 0);
-        loop {
-            if $probe_var < $len {
-                $body
-                $probe_var += 1;
-            } else {
-                $probe_var = 0;
-            }
-        }
-    };
-}
-
-// First part of the robinhood algorithm. Given a key, find the slot in which it
-// will be inserted. This is done by starting at the "ideal" spot. Then scanning
-// until the destination slot is found. A destination slot is either the next
-// empty slot or the next slot that is occupied by an entry that has a lower
-// displacement (displacement is the distance from the ideal spot).
-//
-// This is implemented as a macro instead of a function that takes a closure in
-// order to guarantee that it is "inlined". There is no way to annotate closures
-// to guarantee inlining.
-macro_rules! insert_phase_one {
-    ($map:ident,
-     $key:expr,
-     $probe:ident,
-     $pos:ident,
-     $hash:ident,
-     $danger:ident,
-     $vacant:expr,
-     $occupied:expr,
-     $robinhood:expr) =>
-    {{
-        let $hash = hash_elem_using(&$map.danger, &$key);
-        let mut $probe = desired_pos($map.mask, $hash);
-        let mut dist = 0;
-        let ret;
-
-        // Start at the ideal position, checking all slots
-        probe_loop!('probe: $probe < $map.indices.len(), {
-            if let Some(($pos, entry_hash)) = $map.indices[$probe].resolve() {
-                // The slot is already occupied, but check if it has a lower
-                // displacement.
-                let their_dist = probe_distance($map.mask, entry_hash, $probe);
-
-                if their_dist < dist {
-                    // The new key's distance is larger, so claim this spot and
-                    // displace the current entry.
-                    //
-                    // Check if this insertion is above the danger threshold.
-                    let $danger =
-                        dist >= FORWARD_SHIFT_THRESHOLD && !$map.danger.is_red();
-
-                    ret = $robinhood;
-                    break 'probe;
-                } else if entry_hash == $hash && $map.entries[$pos].key == $key {
-                    // There already is an entry with the same key.
-                    ret = $occupied;
-                    break 'probe;
-                }
-            } else {
-                // The entry is vacant, use it for this key.
-                let $danger =
-                    dist >= FORWARD_SHIFT_THRESHOLD && !$map.danger.is_red();
-
-                ret = $vacant;
-                break 'probe;
-            }
-
-            dist += 1;
-        });
-
-        ret
-    }}
-}
-
-// ===== impl HeaderMap =====
 
 impl HeaderMap {
     /// Create an empty `HeaderMap`.
@@ -462,31 +208,10 @@ impl<T> HeaderMap<T> {
     /// let map: HeaderMap<u32> = HeaderMap::with_capacity(10);
     ///
     /// assert!(map.is_empty());
-    /// assert_eq!(12, map.capacity());
+    /// assert!(map.capacity() >= 10);
     /// ```
     pub fn with_capacity(capacity: usize) -> HeaderMap<T> {
-        assert!(capacity <= MAX_SIZE, "requested capacity too large");
-
-        if capacity == 0 {
-            HeaderMap {
-                mask: 0,
-                indices: Box::new([]), // as a ZST, this doesn't actually allocate anything
-                entries: Vec::new(),
-                extra_values: Vec::new(),
-                danger: Danger::Green,
-            }
-        } else {
-            let raw_cap = to_raw_capacity(capacity).next_power_of_two();
-            debug_assert!(raw_cap > 0);
-
-            HeaderMap {
-                mask: (raw_cap - 1) as Size,
-                indices: vec![Pos::none(); raw_cap].into_boxed_slice(),
-                entries: Vec::with_capacity(raw_cap),
-                extra_values: Vec::new(),
-                danger: Danger::Green,
-            }
-        }
+        HeaderMap { map: HashMap::with_capacity(capacity) }
     }
 
     /// Returns the number of headers stored in the map.
@@ -514,7 +239,7 @@ impl<T> HeaderMap<T> {
     /// assert_eq!(3, map.len());
     /// ```
     pub fn len(&self) -> usize {
-        self.entries.len() + self.extra_values.len()
+        self.map.iter().map(|(_, values)| values.len()).sum()
     }
 
     /// Returns the number of keys stored in the map.
@@ -541,7 +266,7 @@ impl<T> HeaderMap<T> {
     /// assert_eq!(2, map.keys_len());
     /// ```
     pub fn keys_len(&self) -> usize {
-        self.entries.len()
+        self.map.len()
     }
 
     /// Returns true if the map contains no elements.
@@ -560,7 +285,7 @@ impl<T> HeaderMap<T> {
     /// assert!(!map.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.entries.len() == 0
+        self.map.is_empty()
     }
 
     /// Clears the map, removing all key-value pairs. Keeps the allocated memory
@@ -579,13 +304,7 @@ impl<T> HeaderMap<T> {
     /// assert!(map.capacity() > 0);
     /// ```
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.extra_values.clear();
-        self.danger = Danger::Green;
-
-        for e in self.indices.iter_mut() {
-            *e = Pos::none();
-        }
+        self.map.clear();
     }
 
     /// Returns the number of headers the map can hold without reallocating.
@@ -603,10 +322,10 @@ impl<T> HeaderMap<T> {
     /// assert_eq!(0, map.capacity());
     ///
     /// map.insert(HOST, "hello.world".parse().unwrap());
-    /// assert_eq!(6, map.capacity());
+    /// assert!(map.capacity() >= 1);
     /// ```
     pub fn capacity(&self) -> usize {
-        usable_capacity(self.indices.len())
+        self.map.capacity()
     }
 
     /// Reserves capacity for at least `additional` more headers to be inserted
@@ -634,24 +353,12 @@ impl<T> HeaderMap<T> {
     pub fn reserve(&mut self, additional: usize) {
         // TODO: This can't overflow if done properly... since the max # of
         // elements is u16::MAX.
-        let cap = self
-            .entries
-            .len()
-            .checked_add(additional)
-            .expect("reserve overflow");
+        let cap = self.map.len().checked_add(additional).expect("reserve overflow");
 
-        if cap > self.indices.len() {
+        if cap > self.map.capacity() {
             let cap = cap.next_power_of_two();
             assert!(cap < MAX_SIZE, "header map reserve over max capacity");
-            assert!(cap != 0, "header map reserve overflowed");
-
-            if self.entries.len() == 0 {
-                self.mask = cap - 1;
-                self.indices = vec![Pos::none(); cap].into_boxed_slice();
-                self.entries = Vec::with_capacity(usable_capacity(cap));
-            } else {
-                self.grow(cap);
-            }
+            self.map.reserve(additional)
         }
     }
 
@@ -680,20 +387,7 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        self.get2(&key)
-    }
-
-    fn get2<K>(&self, key: &K) -> Option<&T>
-    where
-        K: AsHeaderName,
-    {
-        match key.find(self) {
-            Some((_, found)) => {
-                let entry = &self.entries[found];
-                Some(&entry.value)
-            }
-            None => None,
-        }
+        key.with_header_name(|key| self.map.get(key).and_then(|values| values.first())).unwrap_or(None)
     }
 
     /// Returns a mutable reference to the value associated with the key.
@@ -717,13 +411,7 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        match key.find(self) {
-            Some((_, found)) => {
-                let entry = &mut self.entries[found];
-                Some(&mut entry.value)
-            }
-            None => None,
-        }
+        key.with_header_name(move |key| self.map.get_mut(key).and_then(|values| values.first_mut())).unwrap_or(None)
     }
 
     /// Returns a view of all values associated with a key.
@@ -755,10 +443,7 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        GetAll {
-            map: self,
-            index: key.find(self).map(|(_, i)| i),
-        }
+        key.with_header_name(|key| self.map.get(key).map(|values| GetAll { values })).ok().flatten().unwrap_or(GetAll { values: &[] })
     }
 
     /// Returns true if the map contains a value for the specified key.
@@ -778,7 +463,7 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        key.find(self).is_some()
+        key.with_header_name(|key| self.map.contains_key(key)).unwrap_or(false)
     }
 
     /// An iterator visiting all key-value pairs.
@@ -804,12 +489,7 @@ impl<T> HeaderMap<T> {
     /// ```
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            inner: IterMut {
-                map: self as *const _ as *mut _,
-                entry: 0,
-                cursor: self.entries.first().map(|_| Cursor::Head),
-                lt: PhantomData,
-            },
+            inner: self.map.iter().flat_map(|(header, values)| iter::repeat(header).zip(values.iter())),
         }
     }
 
@@ -836,10 +516,7 @@ impl<T> HeaderMap<T> {
     /// ```
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
-            map: self as *mut _,
-            entry: 0,
-            cursor: self.entries.first().map(|_| Cursor::Head),
-            lt: PhantomData,
+            inner: self.map.iter_mut().flat_map(|(header, values)| iter::repeat(header).zip(values.iter_mut())),
         }
     }
 
@@ -866,7 +543,7 @@ impl<T> HeaderMap<T> {
     /// ```
     pub fn keys(&self) -> Keys<'_, T> {
         Keys {
-            inner: self.entries.iter(),
+            inner: self.map.keys(),
         }
     }
 
@@ -891,7 +568,9 @@ impl<T> HeaderMap<T> {
     /// }
     /// ```
     pub fn values(&self) -> Values<'_, T> {
-        Values { inner: self.iter() }
+        Values {
+            inner: self.map.values().flatten()
+        }
     }
 
     /// An iterator visiting all values mutably.
@@ -916,7 +595,7 @@ impl<T> HeaderMap<T> {
     /// ```
     pub fn values_mut(&mut self) -> ValuesMut<'_, T> {
         ValuesMut {
-            inner: self.iter_mut(),
+            inner: self.map.values_mut().flatten()
         }
     }
 
@@ -950,73 +629,8 @@ impl<T> HeaderMap<T> {
     /// assert_eq!(drain.next(), None);
     /// ```
     pub fn drain(&mut self) -> Drain<'_, T> {
-        for i in self.indices.iter_mut() {
-            *i = Pos::none();
-        }
-
-        // Memory safety
-        //
-        // When the Drain is first created, it shortens the length of
-        // the source vector to make sure no uninitialized or moved-from
-        // elements are accessible at all if the Drain's destructor never
-        // gets to run.
-
-        let entries = &mut self.entries[..] as *mut _;
-        let extra_values = &mut self.extra_values as *mut _;
-        let len = self.entries.len();
-        unsafe { self.entries.set_len(0); }
-
         Drain {
-            idx: 0,
-            len,
-            entries,
-            extra_values,
-            next: None,
-            lt: PhantomData,
-        }
-    }
-
-    fn value_iter(&self, idx: Option<usize>) -> ValueIter<'_, T> {
-        use self::Cursor::*;
-
-        if let Some(idx) = idx {
-            let back = {
-                let entry = &self.entries[idx];
-
-                entry.links.map(|l| Values(l.tail)).unwrap_or(Head)
-            };
-
-            ValueIter {
-                map: self,
-                index: idx,
-                front: Some(Head),
-                back: Some(back),
-            }
-        } else {
-            ValueIter {
-                map: self,
-                index: ::std::usize::MAX,
-                front: None,
-                back: None,
-            }
-        }
-    }
-
-    fn value_iter_mut(&mut self, idx: usize) -> ValueIterMut<'_, T> {
-        use self::Cursor::*;
-
-        let back = {
-            let entry = &self.entries[idx];
-
-            entry.links.map(|l| Values(l.tail)).unwrap_or(Head)
-        };
-
-        ValueIterMut {
-            map: self as *mut _,
-            index: idx,
-            front: Some(Head),
-            back: Some(back),
-            lt: PhantomData,
+            inner: self.map.drain().flat_map(|(header, values)| iter::once(Some(header)).chain(iter::repeat(None)).zip(values)),
         }
     }
 
@@ -1048,7 +662,10 @@ impl<T> HeaderMap<T> {
     where
         K: IntoHeaderName,
     {
-        key.entry(self)
+        match self.map.entry(key.into_header_name()) {
+            hash_map::Entry::Vacant(inner) => Entry::Vacant(VacantEntry { inner }),
+            hash_map::Entry::Occupied(inner) => Entry::Occupied(OccupiedEntry { inner, index: 0 }),
+        }
     }
 
     /// Gets the given key's corresponding entry in the map for in-place
@@ -1064,44 +681,7 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        key.try_entry(self)
-    }
-
-    fn entry2<K>(&mut self, key: K) -> Entry<'_, T>
-    where
-        K: Hash + Into<HeaderName>,
-        HeaderName: PartialEq<K>,
-    {
-        // Ensure that there is space in the map
-        self.reserve_one();
-
-        insert_phase_one!(
-            self,
-            key,
-            probe,
-            pos,
-            hash,
-            danger,
-            Entry::Vacant(VacantEntry {
-                map: self,
-                hash: hash,
-                key: key.into(),
-                probe: probe,
-                danger: danger,
-            }),
-            Entry::Occupied(OccupiedEntry {
-                map: self,
-                index: pos,
-                probe: probe,
-            }),
-            Entry::Vacant(VacantEntry {
-                map: self,
-                hash: hash,
-                key: key.into(),
-                probe: probe,
-                danger: danger,
-            })
-        )
+        key.with_header_name(move |key| self.entry(key))
     }
 
     /// Inserts a key-value pair into the map.
@@ -1135,74 +715,7 @@ impl<T> HeaderMap<T> {
     where
         K: IntoHeaderName,
     {
-        key.insert(self, val)
-    }
-
-    #[inline]
-    fn insert2<K>(&mut self, key: K, value: T) -> Option<T>
-    where
-        K: Hash + Into<HeaderName>,
-        HeaderName: PartialEq<K>,
-    {
-        self.reserve_one();
-
-        insert_phase_one!(
-            self,
-            key,
-            probe,
-            pos,
-            hash,
-            danger,
-            // Vacant
-            {
-                drop(danger); // Make lint happy
-                let index = self.entries.len();
-                self.insert_entry(hash, key.into(), value);
-                self.indices[probe] = Pos::new(index, hash);
-                None
-            },
-            // Occupied
-            Some(self.insert_occupied(pos, value)),
-            // Robinhood
-            {
-                self.insert_phase_two(key.into(), value, hash, probe, danger);
-                None
-            }
-        )
-    }
-
-    /// Set an occupied bucket to the given value
-    #[inline]
-    fn insert_occupied(&mut self, index: usize, value: T) -> T {
-        if let Some(links) = self.entries[index].links {
-            self.remove_all_extra_values(links.next);
-        }
-
-        let entry = &mut self.entries[index];
-        mem::replace(&mut entry.value, value)
-    }
-
-    fn insert_occupied_mult(&mut self, index: usize, value: T) -> ValueDrain<'_, T> {
-        let old;
-        let links;
-
-        {
-            let entry = &mut self.entries[index];
-
-            old = mem::replace(&mut entry.value, value);
-            links = entry.links.take();
-        }
-
-        let raw_links = self.raw_links();
-        let extra_values = &mut self.extra_values as *mut _;
-
-        ValueDrain {
-            raw_links,
-            extra_values,
-            first: Some(old),
-            next: links.map(|l| l.next),
-            lt: PhantomData,
-        }
+        self.map.insert(key.into_header_name(), vec![val]).and_then(|values| values.into_iter().next())
     }
 
     /// Inserts a key-value pair into the map.
@@ -1235,99 +748,16 @@ impl<T> HeaderMap<T> {
     where
         K: IntoHeaderName,
     {
-        key.append(self, value)
-    }
-
-    #[inline]
-    fn append2<K>(&mut self, key: K, value: T) -> bool
-    where
-        K: Hash + Into<HeaderName>,
-        HeaderName: PartialEq<K>,
-    {
-        self.reserve_one();
-
-        insert_phase_one!(
-            self,
-            key,
-            probe,
-            pos,
-            hash,
-            danger,
-            // Vacant
-            {
-                drop(danger);
-                let index = self.entries.len();
-                self.insert_entry(hash, key.into(), value);
-                self.indices[probe] = Pos::new(index, hash);
+        match self.map.entry(key.into_header_name()) {
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(vec![value]);
                 false
-            },
-            // Occupied
-            {
-                append_value(pos, &mut self.entries[pos], &mut self.extra_values, value);
+            }
+            hash_map::Entry::Occupied(entry) => {
+                entry.into_mut().push(value);
                 true
-            },
-            // Robinhood
-            {
-                self.insert_phase_two(key.into(), value, hash, probe, danger);
-
-                false
             }
-        )
-    }
-
-    #[inline]
-    fn find<K: ?Sized>(&self, key: &K) -> Option<(usize, usize)>
-    where
-        K: Hash + Into<HeaderName>,
-        HeaderName: PartialEq<K>,
-    {
-        if self.entries.is_empty() {
-            return None;
         }
-
-        let hash = hash_elem_using(&self.danger, key);
-        let mask = self.mask;
-        let mut probe = desired_pos(mask, hash);
-        let mut dist = 0;
-
-        probe_loop!(probe < self.indices.len(), {
-            if let Some((i, entry_hash)) = self.indices[probe].resolve() {
-                if dist > probe_distance(mask, entry_hash, probe) {
-                    // give up when probe distance is too long
-                    return None;
-                } else if entry_hash == hash && self.entries[i].key == *key {
-                    return Some((probe, i));
-                }
-            } else {
-                return None;
-            }
-
-            dist += 1;
-        });
-    }
-
-    /// phase 2 is post-insert where we forward-shift `Pos` in the indices.
-    #[inline]
-    fn insert_phase_two(
-        &mut self,
-        key: HeaderName,
-        value: T,
-        hash: HashValue,
-        probe: usize,
-        danger: bool,
-    ) -> usize {
-        // Push the value and get the index
-        let index = self.entries.len();
-        self.insert_entry(hash, key, value);
-
-        let num_displaced = do_insert_phase_two(&mut self.indices, probe, Pos::new(index, hash));
-
-        if danger || num_displaced >= DISPLACEMENT_THRESHOLD {
-            // Increase danger level
-            self.danger.to_yellow();
-        }
-
-        index
     }
 
     /// Removes a key from the map, returning the value associated with the key.
@@ -1354,353 +784,8 @@ impl<T> HeaderMap<T> {
     where
         K: AsHeaderName,
     {
-        match key.find(self) {
-            Some((probe, idx)) => {
-                if let Some(links) = self.entries[idx].links {
-                    self.remove_all_extra_values(links.next);
-                }
-
-                let entry = self.remove_found(probe, idx);
-
-                Some(entry.value)
-            }
-            None => None,
-        }
+        key.with_header_name(|key| self.map.remove(key).and_then(|values| values.into_iter().next())).unwrap_or(None)
     }
-
-    /// Remove an entry from the map.
-    #[inline]
-    fn remove_found(&mut self, probe: usize, found: usize) -> Bucket<T> {
-        // index `probe` and entry `found` is to be removed
-        // use swap_remove, but then we need to update the index that points
-        // to the other entry that has to move
-        self.indices[probe] = Pos::none();
-        let entry = self.entries.swap_remove(found);
-
-        // correct index that points to the entry that had to swap places
-        if let Some(entry) = self.entries.get(found) {
-            // was not last element
-            // examine new element in `found` and find it in indices
-            let mut probe = desired_pos(self.mask, entry.hash);
-
-            probe_loop!(probe < self.indices.len(), {
-                if let Some((i, _)) = self.indices[probe].resolve() {
-                    if i >= self.entries.len() {
-                        // found it
-                        self.indices[probe] = Pos::new(found, entry.hash);
-                        break;
-                    }
-                }
-            });
-
-            // Update links
-            if let Some(links) = entry.links {
-                self.extra_values[links.next].prev = Link::Entry(found);
-                self.extra_values[links.tail].next = Link::Entry(found);
-            }
-        }
-
-        // backward shift deletion in self.indices
-        // after probe, shift all non-ideally placed indices backward
-        if self.entries.len() > 0 {
-            let mut last_probe = probe;
-            let mut probe = probe + 1;
-
-            probe_loop!(probe < self.indices.len(), {
-                if let Some((_, entry_hash)) = self.indices[probe].resolve() {
-                    if probe_distance(self.mask, entry_hash, probe) > 0 {
-                        self.indices[last_probe] = self.indices[probe];
-                        self.indices[probe] = Pos::none();
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-
-                last_probe = probe;
-            });
-        }
-
-        entry
-    }
-
-    /// Removes the `ExtraValue` at the given index.
-    #[inline]
-    fn remove_extra_value(&mut self, idx: usize) -> ExtraValue<T> {
-        let raw_links = self.raw_links();
-        remove_extra_value(raw_links, &mut self.extra_values, idx)
-    }
-
-    fn remove_all_extra_values(&mut self, mut head: usize) {
-        loop {
-            let extra = self.remove_extra_value(head);
-
-            if let Link::Extra(idx) = extra.next {
-                head = idx;
-            } else {
-                break;
-            }
-        }
-    }
-
-    #[inline]
-    fn insert_entry(&mut self, hash: HashValue, key: HeaderName, value: T) {
-        assert!(self.entries.len() < MAX_SIZE, "header map at capacity");
-
-        self.entries.push(Bucket {
-            hash: hash,
-            key: key,
-            value: value,
-            links: None,
-        });
-    }
-
-    fn rebuild(&mut self) {
-        // Loop over all entries and re-insert them into the map
-        'outer: for (index, entry) in self.entries.iter_mut().enumerate() {
-            let hash = hash_elem_using(&self.danger, &entry.key);
-            let mut probe = desired_pos(self.mask, hash);
-            let mut dist = 0;
-
-            // Update the entry's hash code
-            entry.hash = hash;
-
-            probe_loop!(probe < self.indices.len(), {
-                if let Some((_, entry_hash)) = self.indices[probe].resolve() {
-                    // if existing element probed less than us, swap
-                    let their_dist = probe_distance(self.mask, entry_hash, probe);
-
-                    if their_dist < dist {
-                        // Robinhood
-                        break;
-                    }
-                } else {
-                    // Vacant slot
-                    self.indices[probe] = Pos::new(index, hash);
-                    continue 'outer;
-                }
-
-                dist += 1;
-            });
-
-            do_insert_phase_two(&mut self.indices, probe, Pos::new(index, hash));
-        }
-    }
-
-    fn reinsert_entry_in_order(&mut self, pos: Pos) {
-        if let Some((_, entry_hash)) = pos.resolve() {
-            // Find first empty bucket and insert there
-            let mut probe = desired_pos(self.mask, entry_hash);
-
-            probe_loop!(probe < self.indices.len(), {
-                if self.indices[probe].resolve().is_none() {
-                    // empty bucket, insert here
-                    self.indices[probe] = pos;
-                    return;
-                }
-            });
-        }
-    }
-
-    fn reserve_one(&mut self) {
-        let len = self.entries.len();
-
-        if self.danger.is_yellow() {
-            let load_factor = self.entries.len() as f32 / self.indices.len() as f32;
-
-            if load_factor >= LOAD_FACTOR_THRESHOLD {
-                // Transition back to green danger level
-                self.danger.to_green();
-
-                // Double the capacity
-                let new_cap = self.indices.len() * 2;
-
-                // Grow the capacity
-                self.grow(new_cap);
-            } else {
-                self.danger.to_red();
-
-                // Rebuild hash table
-                for index in self.indices.iter_mut() {
-                    *index = Pos::none();
-                }
-
-                self.rebuild();
-            }
-        } else if len == self.capacity() {
-            if len == 0 {
-                let new_raw_cap = 8;
-                self.mask = 8 - 1;
-                self.indices = vec![Pos::none(); new_raw_cap].into_boxed_slice();
-                self.entries = Vec::with_capacity(usable_capacity(new_raw_cap));
-            } else {
-                let raw_cap = self.indices.len();
-                self.grow(raw_cap << 1);
-            }
-        }
-    }
-
-    #[inline]
-    fn grow(&mut self, new_raw_cap: usize) {
-        // This path can never be reached when handling the first allocation in
-        // the map.
-
-        // find first ideally placed element -- start of cluster
-        let mut first_ideal = 0;
-
-        for (i, pos) in self.indices.iter().enumerate() {
-            if let Some((_, entry_hash)) = pos.resolve() {
-                if 0 == probe_distance(self.mask, entry_hash, i) {
-                    first_ideal = i;
-                    break;
-                }
-            }
-        }
-
-        // visit the entries in an order where we can simply reinsert them
-        // into self.indices without any bucket stealing.
-        let old_indices = mem::replace(
-            &mut self.indices,
-            vec![Pos::none(); new_raw_cap].into_boxed_slice(),
-        );
-        self.mask = new_raw_cap.wrapping_sub(1) as Size;
-
-        for &pos in &old_indices[first_ideal..] {
-            self.reinsert_entry_in_order(pos);
-        }
-
-        for &pos in &old_indices[..first_ideal] {
-            self.reinsert_entry_in_order(pos);
-        }
-
-        // Reserve additional entry slots
-        let more = self.capacity() - self.entries.len();
-        self.entries.reserve_exact(more);
-    }
-
-    #[inline]
-    fn raw_links(&mut self) -> RawLinks<T> {
-        RawLinks(&mut self.entries[..] as *mut _)
-    }
-}
-
-/// Removes the `ExtraValue` at the given index.
-#[inline]
-fn remove_extra_value<T>(mut raw_links: RawLinks<T>, extra_values: &mut Vec<ExtraValue<T>>, idx: usize) -> ExtraValue<T> {
-    let prev;
-    let next;
-
-    {
-        debug_assert!(extra_values.len() > idx);
-        let extra = &extra_values[idx];
-        prev = extra.prev;
-        next = extra.next;
-    }
-
-    // First unlink the extra value
-    match (prev, next) {
-        (Link::Entry(prev), Link::Entry(next)) => {
-            debug_assert_eq!(prev, next);
-
-            raw_links[prev] = None;
-        }
-        (Link::Entry(prev), Link::Extra(next)) => {
-            debug_assert!(raw_links[prev].is_some());
-
-            raw_links[prev].as_mut().unwrap()
-                .next = next;
-
-            debug_assert!(extra_values.len() > next);
-            extra_values[next].prev = Link::Entry(prev);
-        }
-        (Link::Extra(prev), Link::Entry(next)) => {
-            debug_assert!(raw_links[next].is_some());
-
-            raw_links[next].as_mut().unwrap()
-                .tail = prev;
-
-            debug_assert!(extra_values.len() > prev);
-            extra_values[prev].next = Link::Entry(next);
-        }
-        (Link::Extra(prev), Link::Extra(next)) => {
-            debug_assert!(extra_values.len() > next);
-            debug_assert!(extra_values.len() > prev);
-
-            extra_values[prev].next = Link::Extra(next);
-            extra_values[next].prev = Link::Extra(prev);
-        }
-    }
-
-    // Remove the extra value
-    let mut extra = extra_values.swap_remove(idx);
-
-    // This is the index of the value that was moved (possibly `extra`)
-    let old_idx = extra_values.len();
-
-    // Update the links
-    if extra.prev == Link::Extra(old_idx) {
-        extra.prev = Link::Extra(idx);
-    }
-
-    if extra.next == Link::Extra(old_idx) {
-        extra.next = Link::Extra(idx);
-    }
-
-    // Check if another entry was displaced. If it was, then the links
-    // need to be fixed.
-    if idx != old_idx {
-        let next;
-        let prev;
-
-        {
-            debug_assert!(extra_values.len() > idx);
-            let moved = &extra_values[idx];
-            next = moved.next;
-            prev = moved.prev;
-        }
-
-        // An entry was moved, we have to the links
-        match prev {
-            Link::Entry(entry_idx) => {
-                // It is critical that we do not attempt to read the
-                // header name or value as that memory may have been
-                // "released" already.
-                debug_assert!(raw_links[entry_idx].is_some());
-
-                let links = raw_links[entry_idx].as_mut().unwrap();
-                links.next = idx;
-            }
-            Link::Extra(extra_idx) => {
-                debug_assert!(extra_values.len() > extra_idx);
-                extra_values[extra_idx].next = Link::Extra(idx);
-            }
-        }
-
-        match next {
-            Link::Entry(entry_idx) => {
-                debug_assert!(raw_links[entry_idx].is_some());
-
-                let links = raw_links[entry_idx].as_mut().unwrap();
-                links.tail = idx;
-            }
-            Link::Extra(extra_idx) => {
-                debug_assert!(extra_values.len() > extra_idx);
-                extra_values[extra_idx].prev = Link::Extra(idx);
-            }
-        }
-    }
-
-    debug_assert!({
-        for v in &*extra_values {
-            assert!(v.next != Link::Extra(old_idx));
-            assert!(v.prev != Link::Extra(old_idx));
-        }
-
-        true
-    });
-
-    extra
 }
 
 impl<'a, T> IntoIterator for &'a HeaderMap<T> {
@@ -1776,9 +861,7 @@ impl<T> IntoIterator for HeaderMap<T> {
     /// ```
     fn into_iter(self) -> IntoIter<T> {
         IntoIter {
-            next: None,
-            entries: self.entries.into_iter(),
-            extra_values: self.extra_values,
+            inner: self.map.into_iter().flat_map(|(header, values)| iter::once(Some(header)).chain(iter::repeat(None)).zip(values)),
         }
     }
 }
@@ -1879,14 +962,14 @@ impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
         };
 
         'outer: loop {
-            let mut entry = match self.entry2(key) {
+            let values = match self.entry(key) {
                 Entry::Occupied(mut e) => {
                     // Replace all previous values while maintaining a handle to
                     // the entry.
                     e.insert(val);
-                    e
+                    e.inner.into_mut()
                 }
-                Entry::Vacant(e) => e.insert_entry(val),
+                Entry::Vacant(e) => e.inner.insert(vec![val]),
             };
 
             // As long as `HeaderName` is none, keep inserting the value into
@@ -1899,7 +982,7 @@ impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
                         continue 'outer;
                     }
                     Some((None, v)) => {
-                        entry.append(v);
+                        values.push(v);
                     }
                     None => {
                         return;
@@ -1938,8 +1021,7 @@ impl<T: PartialEq> PartialEq for HeaderMap<T> {
             return false;
         }
 
-        self.keys()
-            .all(|key| self.get_all(key) == other.get_all(key))
+        self.keys().all(|key| self.get_all(key) == other.get_all(key))
     }
 }
 
@@ -1967,67 +1049,9 @@ where
     /// Using the index operator will cause a panic if the header you're querying isn't set.
     #[inline]
     fn index(&self, index: K) -> &T {
-        match self.get2(&index) {
+        match index.with_header_name(|name| self.get(name)).unwrap_or(None) {
             Some(val) => val,
             None => panic!("no entry found for key {:?}", index.as_str()),
-        }
-    }
-}
-
-/// phase 2 is post-insert where we forward-shift `Pos` in the indices.
-///
-/// returns the number of displaced elements
-#[inline]
-fn do_insert_phase_two(indices: &mut [Pos], mut probe: usize, mut old_pos: Pos) -> usize {
-    let mut num_displaced = 0;
-
-    probe_loop!(probe < indices.len(), {
-        let pos = &mut indices[probe];
-
-        if pos.is_none() {
-            *pos = old_pos;
-            break;
-        } else {
-            num_displaced += 1;
-            old_pos = mem::replace(pos, old_pos);
-        }
-    });
-
-    num_displaced
-}
-
-#[inline]
-fn append_value<T>(
-    entry_idx: usize,
-    entry: &mut Bucket<T>,
-    extra: &mut Vec<ExtraValue<T>>,
-    value: T,
-) {
-    match entry.links {
-        Some(links) => {
-            let idx = extra.len();
-            extra.push(ExtraValue {
-                value: value,
-                prev: Link::Extra(links.tail),
-                next: Link::Entry(entry_idx),
-            });
-
-            extra[links.tail].next = Link::Extra(idx);
-
-            entry.links = Some(Links { tail: idx, ..links });
-        }
-        None => {
-            let idx = extra.len();
-            extra.push(ExtraValue {
-                value: value,
-                prev: Link::Entry(entry_idx),
-                next: Link::Entry(entry_idx),
-            });
-
-            entry.links = Some(Links {
-                next: idx,
-                tail: idx,
-            });
         }
     }
 }
@@ -2038,9 +1062,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
     type Item = (&'a HeaderName, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next_unsafe()
-            .map(|(key, ptr)| (key, unsafe { &*ptr }))
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2055,58 +1077,15 @@ unsafe impl<'a, T: Sync> Send for Iter<'a, T> {}
 
 // ===== impl IterMut =====
 
-impl<'a, T> IterMut<'a, T> {
-    fn next_unsafe(&mut self) -> Option<(&'a HeaderName, *mut T)> {
-        use self::Cursor::*;
-
-        if self.cursor.is_none() {
-            if (self.entry + 1) >= unsafe { &*self.map }.entries.len() {
-                return None;
-            }
-
-            self.entry += 1;
-            self.cursor = Some(Cursor::Head);
-        }
-
-        let entry = unsafe { &(*self.map).entries[self.entry] };
-
-        match self.cursor.unwrap() {
-            Head => {
-                self.cursor = entry.links.map(|l| Values(l.next));
-                Some((&entry.key, &entry.value as *const _ as *mut _))
-            }
-            Values(idx) => {
-                let extra = unsafe { &(*self.map).extra_values[idx] };
-
-                match extra.next {
-                    Link::Entry(_) => self.cursor = None,
-                    Link::Extra(i) => self.cursor = Some(Values(i)),
-                }
-
-                Some((&entry.key, &extra.value as *const _ as *mut _))
-            }
-        }
-    }
-}
-
 impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = (&'a HeaderName, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_unsafe()
-            .map(|(key, ptr)| (key, unsafe { &mut *ptr }))
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let map = unsafe { &*self.map };
-        debug_assert!(map.entries.len() >= self.entry);
-
-        let lower = map.entries.len() - self.entry;
-        // We could pessimistically guess at the upper bound, saying
-        // that its lower + map.extra_values.len(). That could be
-        // way over though, such as if we're near the end, and have
-        // already gone through several extra values...
-        (lower, None)
+        self.inner.size_hint()
     }
 }
 
@@ -2121,7 +1100,7 @@ impl<'a, T> Iterator for Keys<'a, T> {
     type Item = &'a HeaderName;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|b| &b.key)
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2138,7 +1117,7 @@ impl<'a, T> Iterator for Values<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2154,7 +1133,7 @@ impl<'a, T> Iterator for ValuesMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -2170,64 +1149,15 @@ impl<'a, T> Iterator for Drain<'a, T> {
     type Item = (Option<HeaderName>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(next) = self.next {
-            // Remove the extra value
-
-            let raw_links = RawLinks(self.entries);
-            let extra = unsafe {
-                remove_extra_value(raw_links, &mut *self.extra_values, next)
-            };
-
-            match extra.next {
-                Link::Extra(idx) => self.next = Some(idx),
-                Link::Entry(_) => self.next = None,
-            }
-
-            return Some((None, extra.value));
-        }
-
-        let idx = self.idx;
-
-        if idx == self.len {
-            return None;
-        }
-
-        self.idx += 1;
-
-        unsafe {
-            let entry = &(*self.entries)[idx];
-
-            // Read the header name
-            let key = ptr::read(&entry.key as *const _);
-            let value = ptr::read(&entry.value as *const _);
-            self.next = entry.links.map(|l| l.next);
-
-            Some((Some(key), value))
-        }
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // At least this many names... It's unknown if the user wants
-        // to count the extra_values on top.
-        //
-        // For instance, extending a new `HeaderMap` wouldn't need to
-        // reserve the upper-bound in `entries`, only the lower-bound.
-        let lower = self.len - self.idx;
-        let upper = unsafe { (*self.extra_values).len() } + lower;
-        (lower, Some(upper))
+        self.inner.size_hint()
     }
 }
 
 impl<'a, T> FusedIterator for Drain<'a, T> {}
-
-impl<'a, T> Drop for Drain<'a, T> {
-    fn drop(&mut self) {
-        for _ in self {}
-    }
-}
-
-unsafe impl<'a, T: Sync> Sync for Drain<'a, T> {}
-unsafe impl<'a, T: Send> Send for Drain<'a, T> {}
 
 // ===== impl Entry =====
 
@@ -2344,7 +1274,7 @@ impl<'a, T> VacantEntry<'a, T> {
     /// assert_eq!(map.entry("x-hello").key().as_str(), "x-hello");
     /// ```
     pub fn key(&self) -> &HeaderName {
-        &self.key
+        self.inner.key()
     }
 
     /// Take ownership of the key
@@ -2360,7 +1290,7 @@ impl<'a, T> VacantEntry<'a, T> {
     /// }
     /// ```
     pub fn into_key(self) -> HeaderName {
-        self.key
+        self.inner.into_key()
     }
 
     /// Insert the value into the entry.
@@ -2381,44 +1311,30 @@ impl<'a, T> VacantEntry<'a, T> {
     /// assert_eq!(map["x-hello"], "world");
     /// ```
     pub fn insert(self, value: T) -> &'a mut T {
-        // Ensure that there is space in the map
-        let index =
-            self.map
-                .insert_phase_two(self.key, value.into(), self.hash, self.probe, self.danger);
-
-        &mut self.map.entries[index].value
+        self.inner.insert(vec![value]).first_mut().unwrap()
     }
 
-    /// Insert the value into the entry.
-    ///
-    /// The value will be associated with this entry's key. The new
-    /// `OccupiedEntry` is returned, allowing for further manipulation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use http::header::*;
-    /// let mut map = HeaderMap::new();
-    ///
-    /// if let Entry::Vacant(v) = map.entry("x-hello") {
-    ///     let mut e = v.insert_entry("world".parse().unwrap());
-    ///     e.insert("world2".parse().unwrap());
-    /// }
-    ///
-    /// assert_eq!(map["x-hello"], "world2");
-    /// ```
-    pub fn insert_entry(self, value: T) -> OccupiedEntry<'a, T> {
-        // Ensure that there is space in the map
-        let index =
-            self.map
-                .insert_phase_two(self.key, value.into(), self.hash, self.probe, self.danger);
-
-        OccupiedEntry {
-            map: self.map,
-            index: index,
-            probe: self.probe,
-        }
-    }
+    // /// Insert the value into the entry.
+    // ///
+    // /// The value will be associated with this entry's key. The new
+    // /// `OccupiedEntry` is returned, allowing for further manipulation.
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// # use http::header::*;
+    // /// let mut map = HeaderMap::new();
+    // ///
+    // /// if let Entry::Vacant(v) = map.entry("x-hello") {
+    // ///     let mut e = v.insert_entry("world".parse().unwrap());
+    // ///     e.insert("world2".parse().unwrap());
+    // /// }
+    // ///
+    // /// assert_eq!(map["x-hello"], "world2");
+    // /// ```
+    // pub fn insert_entry(self, value: T) -> OccupiedEntry<'a, T> {
+    //     self.inner.insert_entry(vec![value]).map(|inner| OccupiedEntry { inner, index: 0 })
+    // }
 }
 
 // ===== impl GetAll =====
@@ -2444,19 +1360,13 @@ impl<'a, T: 'a> GetAll<'a, T> {
     /// assert!(iter.next().is_none());
     /// ```
     pub fn iter(&self) -> ValueIter<'a, T> {
-        // This creates a new GetAll struct so that the lifetime
-        // isn't bound to &self.
-        GetAll {
-            map: self.map,
-            index: self.index,
-        }
-        .into_iter()
+        ValueIter { inner: self.values.iter() }
     }
 }
 
 impl<'a, T: PartialEq> PartialEq for GetAll<'a, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
+        self.values.eq(other.values)
     }
 }
 
@@ -2465,7 +1375,7 @@ impl<'a, T> IntoIterator for GetAll<'a, T> {
     type IntoIter = ValueIter<'a, T>;
 
     fn into_iter(self) -> ValueIter<'a, T> {
-        self.map.value_iter(self.index)
+        ValueIter { inner: self.values.iter() }
     }
 }
 
@@ -2474,7 +1384,7 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b GetAll<'a, T> {
     type IntoIter = ValueIter<'a, T>;
 
     fn into_iter(self) -> ValueIter<'a, T> {
-        self.map.value_iter(self.index)
+        ValueIter { inner: self.values.iter() }
     }
 }
 
@@ -2484,85 +1394,17 @@ impl<'a, T: 'a> Iterator for ValueIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use self::Cursor::*;
-
-        match self.front {
-            Some(Head) => {
-                let entry = &self.map.entries[self.index];
-
-                if self.back == Some(Head) {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    // Update the iterator state
-                    match entry.links {
-                        Some(links) => {
-                            self.front = Some(Values(links.next));
-                        }
-                        None => unreachable!(),
-                    }
-                }
-
-                Some(&entry.value)
-            }
-            Some(Values(idx)) => {
-                let extra = &self.map.extra_values[idx];
-
-                if self.front == self.back {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    match extra.next {
-                        Link::Entry(_) => self.front = None,
-                        Link::Extra(i) => self.front = Some(Values(i)),
-                    }
-                }
-
-                Some(&extra.value)
-            }
-            None => None,
-        }
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match (self.front, self.back) {
-            // Exactly 1 value...
-            (Some(Cursor::Head), Some(Cursor::Head)) => (1, Some(1)),
-            // At least 1...
-            (Some(_), _) => (1, None),
-            // No more values...
-            (None, _) => (0, Some(0)),
-        }
+        self.inner.size_hint()
     }
 }
 
 impl<'a, T: 'a> DoubleEndedIterator for ValueIter<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        use self::Cursor::*;
-
-        match self.back {
-            Some(Head) => {
-                self.front = None;
-                self.back = None;
-                Some(&self.map.entries[self.index].value)
-            }
-            Some(Values(idx)) => {
-                let extra = &self.map.extra_values[idx];
-
-                if self.front == self.back {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    match extra.prev {
-                        Link::Entry(_) => self.back = Some(Head),
-                        Link::Extra(idx) => self.back = Some(Values(idx)),
-                    }
-                }
-
-                Some(&extra.value)
-            }
-            None => None,
-        }
+        self.inner.next_back()
     }
 }
 
@@ -2574,83 +1416,17 @@ impl<'a, T: 'a> Iterator for ValueIterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use self::Cursor::*;
-
-        let entry = unsafe { &mut (*self.map).entries[self.index] };
-
-        match self.front {
-            Some(Head) => {
-                if self.back == Some(Head) {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    // Update the iterator state
-                    match entry.links {
-                        Some(links) => {
-                            self.front = Some(Values(links.next));
-                        }
-                        None => unreachable!(),
-                    }
-                }
-
-                Some(&mut entry.value)
-            }
-            Some(Values(idx)) => {
-                let extra = unsafe { &mut (*self.map).extra_values[idx] };
-
-                if self.front == self.back {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    match extra.next {
-                        Link::Entry(_) => self.front = None,
-                        Link::Extra(i) => self.front = Some(Values(i)),
-                    }
-                }
-
-                Some(&mut extra.value)
-            }
-            None => None,
-        }
+        self.inner.next()
     }
 }
 
 impl<'a, T: 'a> DoubleEndedIterator for ValueIterMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        use self::Cursor::*;
-
-        let entry = unsafe { &mut (*self.map).entries[self.index] };
-
-        match self.back {
-            Some(Head) => {
-                self.front = None;
-                self.back = None;
-                Some(&mut entry.value)
-            }
-            Some(Values(idx)) => {
-                let extra = unsafe { &mut (*self.map).extra_values[idx] };
-
-                if self.front == self.back {
-                    self.front = None;
-                    self.back = None;
-                } else {
-                    match extra.prev {
-                        Link::Entry(_) => self.back = Some(Head),
-                        Link::Extra(idx) => self.back = Some(Values(idx)),
-                    }
-                }
-
-                Some(&mut extra.value)
-            }
-            None => None,
-        }
+        self.inner.next_back()
     }
 }
 
 impl<'a, T> FusedIterator for ValueIterMut<'a, T> {}
-
-unsafe impl<'a, T: Sync> Sync for ValueIterMut<'a, T> {}
-unsafe impl<'a, T: Send> Send for ValueIterMut<'a, T> {}
 
 // ===== impl IntoIter =====
 
@@ -2658,50 +1434,15 @@ impl<T> Iterator for IntoIter<T> {
     type Item = (Option<HeaderName>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(next) = self.next {
-            self.next = match self.extra_values[next].next {
-                Link::Entry(_) => None,
-                Link::Extra(v) => Some(v),
-            };
-
-            let value = unsafe { ptr::read(&self.extra_values[next].value) };
-
-            return Some((None, value));
-        }
-
-        if let Some(bucket) = self.entries.next() {
-            self.next = bucket.links.map(|l| l.next);
-            let name = Some(bucket.key);
-            let value = bucket.value;
-
-            return Some((name, value));
-        }
-
-        None
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (lower, _) = self.entries.size_hint();
-        // There could be more than just the entries upper, as there
-        // could be items in the `extra_values`. We could guess, saying
-        // `upper + extra_values.len()`, but that could overestimate by a lot.
-        (lower, None)
+        self.inner.size_hint()
     }
 }
 
 impl<T> FusedIterator for IntoIter<T> {}
-
-impl<T> Drop for IntoIter<T> {
-    fn drop(&mut self) {
-        // Ensure the iterator is consumed
-        for _ in self.by_ref() {}
-
-        // All the values have already been yielded out.
-        unsafe {
-            self.extra_values.set_len(0);
-        }
-    }
-}
 
 // ===== impl OccupiedEntry =====
 
@@ -2720,7 +1461,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// }
     /// ```
     pub fn key(&self) -> &HeaderName {
-        &self.map.entries[self.index].key
+        self.inner.key()
     }
 
     /// Get a reference to the first value in the entry.
@@ -2747,7 +1488,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// }
     /// ```
     pub fn get(&self) -> &T {
-        &self.map.entries[self.index].value
+        self.inner.get().get(self.index).unwrap()
     }
 
     /// Get a mutable reference to the first value in the entry.
@@ -2771,7 +1512,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// }
     /// ```
     pub fn get_mut(&mut self) -> &mut T {
-        &mut self.map.entries[self.index].value
+        self.inner.get_mut().get_mut(self.index).unwrap()
     }
 
     /// Converts the `OccupiedEntry` into a mutable reference to the **first**
@@ -2798,7 +1539,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("hello.world-2", map["host"]);
     /// ```
     pub fn into_mut(self) -> &'a mut T {
-        &mut self.map.entries[self.index].value
+        self.inner.into_mut().get_mut(self.index).unwrap()
     }
 
     /// Sets the value of the entry.
@@ -2821,7 +1562,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert(&mut self, value: T) -> T {
-        self.map.insert_occupied(self.index, value.into())
+        self.inner.insert(vec![value]).into_iter().next().unwrap()
     }
 
     /// Sets the value of the entry.
@@ -2847,7 +1588,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert_mult(&mut self, value: T) -> ValueDrain<'_, T> {
-        self.map.insert_occupied_mult(self.index, value.into())
+        ValueDrain { inner: self.inner.insert(vec![value]).into_iter(), _marker: PhantomData }
     }
 
     /// Insert the value into the entry.
@@ -2872,9 +1613,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", *i.next().unwrap());
     /// ```
     pub fn append(&mut self, value: T) {
-        let idx = self.index;
-        let entry = &mut self.map.entries[idx];
-        append_value(idx, entry, &mut self.map.extra_values, value.into());
+        self.inner.get_mut().push(value);
     }
 
     /// Remove the entry from the map.
@@ -2897,7 +1636,8 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert!(!map.contains_key("host"));
     /// ```
     pub fn remove(self) -> T {
-        self.remove_entry().1
+        let (_, values) = self.inner.remove_entry();
+        values.into_iter().next().unwrap()
     }
 
     /// Remove the entry from the map.
@@ -2922,32 +1662,27 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert!(!map.contains_key("host"));
     /// ```
     pub fn remove_entry(self) -> (HeaderName, T) {
-        let entry = self.map.remove_found(self.probe, self.index);
-
-        if let Some(links) = entry.links {
-            self.map.remove_all_extra_values(links.next);
-        }
-
-        (entry.key, entry.value)
+        let (key, values) = self.inner.remove_entry();
+        (key, values.into_iter().next().unwrap())
     }
 
-    /// Remove the entry from the map.
-    ///
-    /// The key and all values associated with the entry are removed and
-    /// returned.
-    pub fn remove_entry_mult(self) -> (HeaderName, ValueDrain<'a, T>) {
-        let entry = self.map.remove_found(self.probe, self.index);
-        let raw_links = self.map.raw_links();
-        let extra_values = &mut self.map.extra_values as *mut _;
-        let drain = ValueDrain {
-            raw_links,
-            extra_values,
-            first: Some(entry.value),
-            next: entry.links.map(|l| l.next),
-            lt: PhantomData,
-        };
-        (entry.key, drain)
-    }
+    // /// Remove the entry from the map.
+    // ///
+    // /// The key and all values associated with the entry are removed and
+    // /// returned.
+    // pub fn remove_entry_mult(self) -> (HeaderName, ValueDrain<'a, T>) {
+    //     let entry = self.map.remove_found(self.probe, self.index);
+    //     let raw_links = self.map.raw_links();
+    //     let extra_values = &mut self.map.extra_values as *mut _;
+    //     let drain = ValueDrain {
+    //         raw_links,
+    //         extra_values,
+    //         first: Some(entry.value),
+    //         next: entry.links.map(|l| l.next),
+    //         lt: PhantomData,
+    //     };
+    //     (entry.key, drain)
+    // }
 
     /// Returns an iterator visiting all values associated with the entry.
     ///
@@ -2969,7 +1704,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// }
     /// ```
     pub fn iter(&self) -> ValueIter<'_, T> {
-        self.map.value_iter(Some(self.index))
+        self.into_iter()
     }
 
     /// Returns an iterator mutably visiting all values associated with the
@@ -2997,7 +1732,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!(&"earth-boop", i.next().unwrap());
     /// ```
     pub fn iter_mut(&mut self) -> ValueIterMut<'_, T> {
-        self.map.value_iter_mut(self.index)
+        ValueIterMut { inner: self.inner.get_mut().iter_mut() }
     }
 }
 
@@ -3006,7 +1741,7 @@ impl<'a, T> IntoIterator for OccupiedEntry<'a, T> {
     type IntoIter = ValueIterMut<'a, T>;
 
     fn into_iter(self) -> ValueIterMut<'a, T> {
-        self.map.value_iter_mut(self.index)
+        ValueIterMut { inner: self.inner.into_mut().iter_mut() }
     }
 }
 
@@ -3015,7 +1750,7 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b OccupiedEntry<'a, T> {
     type IntoIter = ValueIter<'a, T>;
 
     fn into_iter(self) -> ValueIter<'a, T> {
-        self.iter()
+        ValueIter { inner: self.inner.get().iter() }
     }
 }
 
@@ -3034,198 +1769,15 @@ impl<'a, T> Iterator for ValueDrain<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        if self.first.is_some() {
-            self.first.take()
-        } else if let Some(next) = self.next {
-            // Remove the extra value
-            let extra = unsafe {
-                remove_extra_value(self.raw_links, &mut *self.extra_values, next)
-            };
-
-            match extra.next {
-                Link::Extra(idx) => self.next = Some(idx),
-                Link::Entry(_) => self.next = None,
-            }
-
-            Some(extra.value)
-        } else {
-            None
-        }
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match (&self.first, self.next) {
-            // Exactly 1
-            (&Some(_), None) => (1, Some(1)),
-            // At least 1
-            (&_, Some(_)) => (1, None),
-            // No more
-            (&None, None) => (0, Some(0)),
-        }
+        self.inner.size_hint()
     }
 }
 
 impl<'a, T> FusedIterator for ValueDrain<'a, T> {}
-
-impl<'a, T> Drop for ValueDrain<'a, T> {
-    fn drop(&mut self) {
-        while let Some(_) = self.next() {}
-    }
-}
-
-unsafe impl<'a, T: Sync> Sync for ValueDrain<'a, T> {}
-unsafe impl<'a, T: Send> Send for ValueDrain<'a, T> {}
-
-// ===== impl RawLinks =====
-
-impl<T> Clone for RawLinks<T> {
-    fn clone(&self) -> RawLinks<T> {
-        *self
-    }
-}
-
-impl<T> Copy for RawLinks<T> {}
-
-impl<T> ops::Index<usize> for RawLinks<T> {
-    type Output = Option<Links>;
-
-    fn index(&self, idx: usize) -> &Self::Output {
-        unsafe {
-            &(*self.0)[idx].links
-        }
-    }
-}
-
-impl<T> ops::IndexMut<usize> for RawLinks<T> {
-    fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
-        unsafe {
-            &mut (*self.0)[idx].links
-        }
-    }
-}
-
-// ===== impl Pos =====
-
-impl Pos {
-    #[inline]
-    fn new(index: usize, hash: HashValue) -> Self {
-        Pos {
-            index: index as Size,
-            hash: hash,
-        }
-    }
-
-    #[inline]
-    fn none() -> Self {
-        Pos {
-            index: !0,
-            hash: HashValue(0),
-        }
-    }
-
-    #[inline]
-    fn is_some(&self) -> bool {
-        !self.is_none()
-    }
-
-    #[inline]
-    fn is_none(&self) -> bool {
-        self.index == !0
-    }
-
-    #[inline]
-    fn resolve(&self) -> Option<(usize, HashValue)> {
-        if self.is_some() {
-            Some((self.index, self.hash))
-        } else {
-            None
-        }
-    }
-}
-
-impl Danger {
-    fn is_red(&self) -> bool {
-        match *self {
-            Danger::Red(_) => true,
-            _ => false,
-        }
-    }
-
-    fn to_red(&mut self) {
-        debug_assert!(self.is_yellow());
-        *self = Danger::Red(RandomState::new());
-    }
-
-    fn is_yellow(&self) -> bool {
-        match *self {
-            Danger::Yellow => true,
-            _ => false,
-        }
-    }
-
-    fn to_yellow(&mut self) {
-        match *self {
-            Danger::Green => {
-                *self = Danger::Yellow;
-            }
-            _ => {}
-        }
-    }
-
-    fn to_green(&mut self) {
-        debug_assert!(self.is_yellow());
-        *self = Danger::Green;
-    }
-}
-
-// ===== impl Utils =====
-
-#[inline]
-fn usable_capacity(cap: usize) -> usize {
-    cap - cap / 4
-}
-
-#[inline]
-fn to_raw_capacity(n: usize) -> usize {
-    n + n / 3
-}
-
-#[inline]
-fn desired_pos(mask: Size, hash: HashValue) -> usize {
-    (hash.0 & mask)
-}
-
-/// The number of steps that `current` is forward of the desired position for hash
-#[inline]
-fn probe_distance(mask: Size, hash: HashValue, current: usize) -> usize {
-    current.wrapping_sub(desired_pos(mask, hash)) & mask
-}
-
-fn hash_elem_using<K: ?Sized>(danger: &Danger, k: &K) -> HashValue
-where
-    K: Hash,
-{
-    use fnv::FnvHasher;
-
-    const MASK: u64 = (MAX_SIZE as u64) - 1;
-
-    let hash = match *danger {
-        // Safe hash
-        Danger::Red(ref hasher) => {
-            let mut h = hasher.build_hasher();
-            k.hash(&mut h);
-            h.finish()
-        }
-        // Fast hash
-        _ => {
-            let mut h = FnvHasher::default();
-            k.hash(&mut h);
-            h.finish()
-        }
-    };
-
-    HashValue((hash & MASK) as usize)
-}
 
 /*
  *
@@ -3234,7 +1786,7 @@ where
  */
 
 mod into_header_name {
-    use super::{Entry, HdrName, HeaderMap, HeaderName};
+    use super::HeaderName;
 
     /// A marker trait used to identify values that can be used as insert keys
     /// to a `HeaderMap`.
@@ -3250,13 +1802,7 @@ mod into_header_name {
     // without breaking any external crate.
     pub trait Sealed {
         #[doc(hidden)]
-        fn insert<T>(self, map: &mut HeaderMap<T>, val: T) -> Option<T>;
-
-        #[doc(hidden)]
-        fn append<T>(self, map: &mut HeaderMap<T>, val: T) -> bool;
-
-        #[doc(hidden)]
-        fn entry<T>(self, map: &mut HeaderMap<T>) -> Entry<'_, T>;
+        fn into_header_name(self) -> HeaderName;
     }
 
     // ==== impls ====
@@ -3264,20 +1810,8 @@ mod into_header_name {
     impl Sealed for HeaderName {
         #[doc(hidden)]
         #[inline]
-        fn insert<T>(self, map: &mut HeaderMap<T>, val: T) -> Option<T> {
-            map.insert2(self, val)
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn append<T>(self, map: &mut HeaderMap<T>, val: T) -> bool {
-            map.append2(self, val)
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn entry<T>(self, map: &mut HeaderMap<T>) -> Entry<'_, T> {
-            map.entry2(self)
+        fn into_header_name(self) -> HeaderName {
+            self
         }
     }
 
@@ -3286,19 +1820,8 @@ mod into_header_name {
     impl<'a> Sealed for &'a HeaderName {
         #[doc(hidden)]
         #[inline]
-        fn insert<T>(self, map: &mut HeaderMap<T>, val: T) -> Option<T> {
-            map.insert2(self, val)
-        }
-        #[doc(hidden)]
-        #[inline]
-        fn append<T>(self, map: &mut HeaderMap<T>, val: T) -> bool {
-            map.append2(self, val)
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn entry<T>(self, map: &mut HeaderMap<T>) -> Entry<'_, T> {
-            map.entry2(self)
+        fn into_header_name(self) -> HeaderName {
+            self.clone()
         }
     }
 
@@ -3307,19 +1830,8 @@ mod into_header_name {
     impl Sealed for &'static str {
         #[doc(hidden)]
         #[inline]
-        fn insert<T>(self, map: &mut HeaderMap<T>, val: T) -> Option<T> {
-            HdrName::from_static(self, move |hdr| map.insert2(hdr, val))
-        }
-        #[doc(hidden)]
-        #[inline]
-        fn append<T>(self, map: &mut HeaderMap<T>, val: T) -> bool {
-            HdrName::from_static(self, move |hdr| map.append2(hdr, val))
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn entry<T>(self, map: &mut HeaderMap<T>) -> Entry<'_, T> {
-            HdrName::from_static(self, move |hdr| map.entry2(hdr))
+        fn into_header_name(self) -> HeaderName {
+            HeaderName::from_bytes(self.as_bytes()).unwrap()
         }
     }
 
@@ -3327,7 +1839,7 @@ mod into_header_name {
 }
 
 mod as_header_name {
-    use super::{Entry, HdrName, HeaderMap, HeaderName, InvalidHeaderName};
+    use super::{HeaderName, InvalidHeaderName};
 
     /// A marker trait used to identify values that can be used as search keys
     /// to a `HeaderMap`.
@@ -3343,10 +1855,7 @@ mod as_header_name {
     // without breaking any external crate.
     pub trait Sealed {
         #[doc(hidden)]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName>;
-
-        #[doc(hidden)]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)>;
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName>;
 
         #[doc(hidden)]
         fn as_str(&self) -> &str;
@@ -3357,14 +1866,8 @@ mod as_header_name {
     impl Sealed for HeaderName {
         #[doc(hidden)]
         #[inline]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName> {
-            Ok(map.entry2(self))
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)> {
-            map.find(self)
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName> {
+            Ok(f(self))
         }
 
         #[doc(hidden)]
@@ -3378,14 +1881,8 @@ mod as_header_name {
     impl<'a> Sealed for &'a HeaderName {
         #[doc(hidden)]
         #[inline]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName> {
-            Ok(map.entry2(self))
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)> {
-            map.find(*self)
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName> {
+            Ok(f(*self))
         }
 
         #[doc(hidden)]
@@ -3399,14 +1896,8 @@ mod as_header_name {
     impl<'a> Sealed for &'a str {
         #[doc(hidden)]
         #[inline]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName> {
-            HdrName::from_bytes(self.as_bytes(), move |hdr| map.entry2(hdr))
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)> {
-            HdrName::from_bytes(self.as_bytes(), move |hdr| map.find(&hdr)).unwrap_or(None)
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName> {
+            HeaderName::from_bytes(self.as_bytes()).map(move |hdr| f(&hdr))
         }
 
         #[doc(hidden)]
@@ -3420,14 +1911,8 @@ mod as_header_name {
     impl Sealed for String {
         #[doc(hidden)]
         #[inline]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName> {
-            self.as_str().try_entry(map)
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)> {
-            Sealed::find(&self.as_str(), map)
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName> {
+            self.as_str().with_header_name(f)
         }
 
         #[doc(hidden)]
@@ -3441,14 +1926,8 @@ mod as_header_name {
     impl<'a> Sealed for &'a String {
         #[doc(hidden)]
         #[inline]
-        fn try_entry<T>(self, map: &mut HeaderMap<T>) -> Result<Entry<'_, T>, InvalidHeaderName> {
-            self.as_str().try_entry(map)
-        }
-
-        #[doc(hidden)]
-        #[inline]
-        fn find<T>(&self, map: &HeaderMap<T>) -> Option<(usize, usize)> {
-            Sealed::find(*self, map)
+        fn with_header_name<T>(&self, f: impl FnOnce(&HeaderName) -> T) -> Result<T, InvalidHeaderName> {
+            self.as_str().with_header_name(f)
         }
 
         #[doc(hidden)]
