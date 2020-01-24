@@ -2,8 +2,9 @@ use std::collections::{hash_map, HashMap};
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::iter::{self, FromIterator, FusedIterator};
-use std::{fmt, ops, vec, slice};
+use std::{fmt, ops, slice};
 use std::marker::PhantomData;
+use tinyvec::{TinyVec, tiny_vec};
 
 use crate::Error;
 
@@ -41,8 +42,8 @@ pub use self::into_header_name::IntoHeaderName;
 /// assert!(!headers.contains_key(HOST));
 /// ```
 #[derive(Clone)]
-pub struct HeaderMap<T = HeaderValue> {
-    map: HashMap<HeaderName, Vec<T>>,
+pub struct HeaderMap<T: Default = HeaderValue> {
+    map: HashMap<HeaderName, TinyVec<[T; 1]>>,
 }
 
 /// `HeaderMap` entry iterator.
@@ -50,8 +51,8 @@ pub struct HeaderMap<T = HeaderValue> {
 /// Yields `(&HeaderName, &value)` tuples. The same header name may be yielded
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
-pub struct Iter<'a, T> {
-    inner: iter::FlatMap<hash_map::Iter<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>, fn((&'a HeaderName, &'a Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>>,
+pub struct Iter<'a, T: Default> {
+    inner: iter::FlatMap<hash_map::Iter<'a, HeaderName, TinyVec<[T; 1]>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>, fn((&'a HeaderName, &'a TinyVec<[T; 1]>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>>,
 }
 
 /// `HeaderMap` mutable entry iterator
@@ -59,16 +60,16 @@ pub struct Iter<'a, T> {
 /// Yields `(&HeaderName, &mut value)` tuples. The same header name may be
 /// yielded more than once if it has more than one associated value.
 #[derive(Debug)]
-pub struct IterMut<'a, T> {
-    inner: iter::FlatMap<hash_map::IterMut<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>, fn((&'a HeaderName, &'a mut Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>>,
+pub struct IterMut<'a, T: Default> {
+    inner: iter::FlatMap<hash_map::IterMut<'a, HeaderName, TinyVec<[T; 1]>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>, fn((&'a HeaderName, &'a mut TinyVec<[T; 1]>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>>,
 }
 
 /// An owning iterator over the entries of a `HeaderMap`.
 ///
 /// This struct is created by the `into_iter` method on `HeaderMap`.
 #[derive(Debug)]
-pub struct IntoIter<T> {
-    inner: iter::FlatMap<hash_map::IntoIter<HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
+pub struct IntoIter<T: Default> {
+    inner: iter::FlatMap<hash_map::IntoIter<HeaderName, TinyVec<[T; 1]>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, tinyvec::TinyVecIterator<[T; 1]>>, fn((HeaderName, TinyVec<[T; 1]>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, tinyvec::TinyVecIterator<[T; 1]>>>,
 }
 
 /// An iterator over `HeaderMap` keys.
@@ -76,41 +77,41 @@ pub struct IntoIter<T> {
 /// Each header name is yielded only once, even if it has more than one
 /// associated value.
 #[derive(Debug)]
-pub struct Keys<'a, T> {
-    inner: hash_map::Keys<'a, HeaderName, Vec<T>>,
+pub struct Keys<'a, T: Default> {
+    inner: hash_map::Keys<'a, HeaderName, TinyVec<[T; 1]>>,
 }
 
 /// `HeaderMap` value iterator.
 ///
 /// Each value contained in the `HeaderMap` will be yielded.
 #[derive(Debug)]
-pub struct Values<'a, T> {
-    inner: iter::Flatten<hash_map::Values<'a, HeaderName, Vec<T>>>,
+pub struct Values<'a, T: Default> {
+    inner: iter::Flatten<hash_map::Values<'a, HeaderName, TinyVec<[T; 1]>>>,
 }
 
 /// `HeaderMap` mutable value iterator
 #[derive(Debug)]
-pub struct ValuesMut<'a, T> {
-    inner: iter::Flatten<hash_map::ValuesMut<'a, HeaderName, Vec<T>>>,
+pub struct ValuesMut<'a, T: Default> {
+    inner: iter::Flatten<hash_map::ValuesMut<'a, HeaderName, TinyVec<[T; 1]>>>,
 }
 
 /// A drain iterator for `HeaderMap`.
 #[derive(Debug)]
-pub struct Drain<'a, T> {
-    inner: iter::FlatMap<hash_map::Drain<'a, HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
+pub struct Drain<'a, T: Default> {
+    inner: iter::FlatMap<hash_map::Drain<'a, HeaderName, TinyVec<[T; 1]>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, tinyvec::TinyVecIterator<[T; 1]>>, fn((HeaderName, TinyVec<[T; 1]>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, tinyvec::TinyVecIterator<[T; 1]>>>,
 }
 
 /// A view to all values stored in a single entry.
 ///
 /// This struct is returned by `HeaderMap::get_all`.
 #[derive(Debug)]
-pub struct GetAll<'a, T> {
+pub struct GetAll<'a, T: Default> {
     values: &'a [T],
 }
 
 /// A view into a single location in a `HeaderMap`, which may be vacant or occupied.
 #[derive(Debug)]
-pub enum Entry<'a, T: 'a> {
+pub enum Entry<'a, T: Default + 'a> {
     /// An occupied entry
     Occupied(OccupiedEntry<'a, T>),
 
@@ -122,35 +123,35 @@ pub enum Entry<'a, T: 'a> {
 ///
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
-pub struct VacantEntry<'a, T> {
-    inner: hash_map::VacantEntry<'a, HeaderName, Vec<T>>,
+pub struct VacantEntry<'a, T: Default> {
+    inner: hash_map::VacantEntry<'a, HeaderName, TinyVec<[T; 1]>>,
 }
 
 /// A view into a single occupied location in a `HeaderMap`.
 ///
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
-pub struct OccupiedEntry<'a, T> {
-    inner: hash_map::OccupiedEntry<'a, HeaderName, Vec<T>>,
+pub struct OccupiedEntry<'a, T: Default> {
+    inner: hash_map::OccupiedEntry<'a, HeaderName, TinyVec<[T; 1]>>,
     index: usize,
 }
 
 /// An iterator of all values associated with a single header name.
 #[derive(Debug)]
-pub struct ValueIter<'a, T> {
+pub struct ValueIter<'a, T: Default> {
     inner: slice::Iter<'a, T>,
 }
 
 /// A mutable iterator of all values associated with a single header name.
 #[derive(Debug)]
-pub struct ValueIterMut<'a, T> {
+pub struct ValueIterMut<'a, T: Default> {
     inner: slice::IterMut<'a, T>,
 }
 
 /// An drain iterator of all values associated with a single header name.
 #[derive(Debug)]
-pub struct ValueDrain<'a, T> {
-    inner: vec::IntoIter<T>,
+pub struct ValueDrain<'a, T: Default> {
+    inner: tinyvec::TinyVecIterator<[T; 1]>,
     _marker: PhantomData<&'a mut HeaderMap>,
 }
 
@@ -191,7 +192,7 @@ impl HeaderMap {
     }
 }
 
-impl<T> HeaderMap<T> {
+impl<T: Default> HeaderMap<T> {
     /// Create an empty `HeaderMap` with the specified capacity.
     ///
     /// The returned map will allocate internal storage in order to hold about
@@ -720,7 +721,7 @@ impl<T> HeaderMap<T> {
     where
         K: IntoHeaderName,
     {
-        self.map.insert(key.into_header_name(), vec![val]).and_then(|values| values.into_iter().next())
+        self.map.insert(key.into_header_name(), tiny_vec![[T; 1], val]).and_then(|values| values.into_iter().next())
     }
 
     /// Inserts a key-value pair into the map.
@@ -755,7 +756,7 @@ impl<T> HeaderMap<T> {
     {
         match self.map.entry(key.into_header_name()) {
             hash_map::Entry::Vacant(entry) => {
-                entry.insert(vec![value]);
+                entry.insert(tiny_vec![[T; 1], value]);
                 false
             }
             hash_map::Entry::Occupied(entry) => {
@@ -793,7 +794,7 @@ impl<T> HeaderMap<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a HeaderMap<T> {
+impl<'a, T: Default> IntoIterator for &'a HeaderMap<T> {
     type Item = (&'a HeaderName, &'a T);
     type IntoIter = Iter<'a, T>;
 
@@ -802,7 +803,7 @@ impl<'a, T> IntoIterator for &'a HeaderMap<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a mut HeaderMap<T> {
+impl<'a, T: Default> IntoIterator for &'a mut HeaderMap<T> {
     type Item = (&'a HeaderName, &'a mut T);
     type IntoIter = IterMut<'a, T>;
 
@@ -811,7 +812,7 @@ impl<'a, T> IntoIterator for &'a mut HeaderMap<T> {
     }
 }
 
-impl<T> IntoIterator for HeaderMap<T> {
+impl<T: Default> IntoIterator for HeaderMap<T> {
     type Item = (Option<HeaderName>, T);
     type IntoIter = IntoIter<T>;
 
@@ -887,7 +888,7 @@ impl<T> IntoIterator for HeaderMap<T> {
     }
 }
 
-impl<T> FromIterator<(HeaderName, T)> for HeaderMap<T> {
+impl<T: Default> FromIterator<(HeaderName, T)> for HeaderMap<T> {
     fn from_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (HeaderName, T)>,
@@ -913,7 +914,7 @@ impl<T> FromIterator<(HeaderName, T)> for HeaderMap<T> {
 /// let headers: HeaderMap = (&map).try_into().expect("valid headers");
 /// assert_eq!(headers["X-Custom-Header"], "my value");
 /// ```
-impl<'a, K, V, T> TryFrom<&'a HashMap<K, V>> for HeaderMap<T>
+impl<'a, K, V, T: Default> TryFrom<&'a HashMap<K, V>> for HeaderMap<T>
     where
         K: Eq + Hash,
         HeaderName: TryFrom<&'a K>,
@@ -934,7 +935,7 @@ impl<'a, K, V, T> TryFrom<&'a HashMap<K, V>> for HeaderMap<T>
     }
 }
 
-impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
+impl<T: Default> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
     /// Extend a `HeaderMap` with the contents of another `HeaderMap`.
     ///
     /// This function expects the yielded items to follow the same structure as
@@ -990,7 +991,7 @@ impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
                     e.insert(val);
                     e.inner.into_mut()
                 }
-                Entry::Vacant(e) => e.inner.insert(vec![val]),
+                Entry::Vacant(e) => e.inner.insert(tiny_vec![[T; 1], val]),
             };
 
             // As long as `HeaderName` is none, keep inserting the value into
@@ -1014,7 +1015,7 @@ impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
     }
 }
 
-impl<T> Extend<(HeaderName, T)> for HeaderMap<T> {
+impl<T: Default> Extend<(HeaderName, T)> for HeaderMap<T> {
     fn extend<I: IntoIterator<Item = (HeaderName, T)>>(&mut self, iter: I) {
         // Keys may be already present or show multiple times in the iterator.
         // Reserve the entire hint lower bound if the map is empty.
@@ -1036,7 +1037,7 @@ impl<T> Extend<(HeaderName, T)> for HeaderMap<T> {
     }
 }
 
-impl<T: PartialEq> PartialEq for HeaderMap<T> {
+impl<T: Default + PartialEq> PartialEq for HeaderMap<T> {
     fn eq(&self, other: &HeaderMap<T>) -> bool {
         if self.len() != other.len() {
             return false;
@@ -1046,21 +1047,21 @@ impl<T: PartialEq> PartialEq for HeaderMap<T> {
     }
 }
 
-impl<T: Eq> Eq for HeaderMap<T> {}
+impl<T: Default + Eq> Eq for HeaderMap<T> {}
 
-impl<T: fmt::Debug> fmt::Debug for HeaderMap<T> {
+impl<T: Default + fmt::Debug> fmt::Debug for HeaderMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<T> Default for HeaderMap<T> {
+impl<T: Default> Default for HeaderMap<T> {
     fn default() -> Self {
         HeaderMap::with_capacity(0)
     }
 }
 
-impl<'a, K, T> ops::Index<K> for HeaderMap<T>
+impl<'a, K, T: Default> ops::Index<K> for HeaderMap<T>
 where
     K: AsHeaderName,
 {
@@ -1079,7 +1080,7 @@ where
 
 // ===== impl Iter =====
 
-impl<'a, T> Iterator for Iter<'a, T> {
+impl<'a, T: Default> Iterator for Iter<'a, T> {
     type Item = (&'a HeaderName, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1091,14 +1092,14 @@ impl<'a, T> Iterator for Iter<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for Iter<'a, T> {}
+impl<'a, T: Default> FusedIterator for Iter<'a, T> {}
 
-unsafe impl<'a, T: Sync> Sync for Iter<'a, T> {}
-unsafe impl<'a, T: Sync> Send for Iter<'a, T> {}
+unsafe impl<'a, T: Default + Sync> Sync for Iter<'a, T> {}
+unsafe impl<'a, T: Default + Sync> Send for Iter<'a, T> {}
 
 // ===== impl IterMut =====
 
-impl<'a, T> Iterator for IterMut<'a, T> {
+impl<'a, T: Default> Iterator for IterMut<'a, T> {
     type Item = (&'a HeaderName, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1110,14 +1111,14 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for IterMut<'a, T> {}
+impl<'a, T: Default> FusedIterator for IterMut<'a, T> {}
 
-unsafe impl<'a, T: Sync> Sync for IterMut<'a, T> {}
-unsafe impl<'a, T: Send> Send for IterMut<'a, T> {}
+unsafe impl<'a, T: Default + Sync> Sync for IterMut<'a, T> {}
+unsafe impl<'a, T: Default + Send> Send for IterMut<'a, T> {}
 
 // ===== impl Keys =====
 
-impl<'a, T> Iterator for Keys<'a, T> {
+impl<'a, T: Default> Iterator for Keys<'a, T> {
     type Item = &'a HeaderName;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1129,12 +1130,12 @@ impl<'a, T> Iterator for Keys<'a, T> {
     }
 }
 
-impl<'a, T> ExactSizeIterator for Keys<'a, T> {}
-impl<'a, T> FusedIterator for Keys<'a, T> {}
+impl<'a, T: Default> ExactSizeIterator for Keys<'a, T> {}
+impl<'a, T: Default> FusedIterator for Keys<'a, T> {}
 
 // ===== impl Values ====
 
-impl<'a, T> Iterator for Values<'a, T> {
+impl<'a, T: Default> Iterator for Values<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1146,11 +1147,11 @@ impl<'a, T> Iterator for Values<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for Values<'a, T> {}
+impl<'a, T: Default> FusedIterator for Values<'a, T> {}
 
 // ===== impl ValuesMut ====
 
-impl<'a, T> Iterator for ValuesMut<'a, T> {
+impl<'a, T: Default> Iterator for ValuesMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1162,11 +1163,11 @@ impl<'a, T> Iterator for ValuesMut<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for ValuesMut<'a, T> {}
+impl<'a, T: Default> FusedIterator for ValuesMut<'a, T> {}
 
 // ===== impl Drain =====
 
-impl<'a, T> Iterator for Drain<'a, T> {
+impl<'a, T: Default> Iterator for Drain<'a, T> {
     type Item = (Option<HeaderName>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1178,11 +1179,11 @@ impl<'a, T> Iterator for Drain<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for Drain<'a, T> {}
+impl<'a, T: Default> FusedIterator for Drain<'a, T> {}
 
 // ===== impl Entry =====
 
-impl<'a, T> Entry<'a, T> {
+impl<'a, T: Default> Entry<'a, T> {
     /// Ensures a value is in the entry by inserting the default if empty.
     ///
     /// Returns a mutable reference to the **first** value in the entry.
@@ -1283,7 +1284,7 @@ impl<'a, T> Entry<'a, T> {
 
 // ===== impl VacantEntry =====
 
-impl<'a, T> VacantEntry<'a, T> {
+impl<'a, T: Default> VacantEntry<'a, T> {
     /// Returns a reference to the entry's key
     ///
     /// # Examples
@@ -1332,7 +1333,7 @@ impl<'a, T> VacantEntry<'a, T> {
     /// assert_eq!(map["x-hello"], "world");
     /// ```
     pub fn insert(self, value: T) -> &'a mut T {
-        self.inner.insert(vec![value]).first_mut().unwrap()
+        self.inner.insert(tiny_vec![[T; 1], value]).first_mut().unwrap()
     }
 
     // /// Insert the value into the entry.
@@ -1354,13 +1355,13 @@ impl<'a, T> VacantEntry<'a, T> {
     // /// assert_eq!(map["x-hello"], "world2");
     // /// ```
     // pub fn insert_entry(self, value: T) -> OccupiedEntry<'a, T> {
-    //     self.inner.insert_entry(vec![value]).map(|inner| OccupiedEntry { inner, index: 0 })
+    //     self.inner.insert_entry(tiny_vec![[T; 1], value]).map(|inner| OccupiedEntry { inner, index: 0 })
     // }
 }
 
 // ===== impl GetAll =====
 
-impl<'a, T: 'a> GetAll<'a, T> {
+impl<'a, T: Default + 'a> GetAll<'a, T> {
     /// Returns an iterator visiting all values associated with the entry.
     ///
     /// Values are iterated in insertion order.
@@ -1385,13 +1386,13 @@ impl<'a, T: 'a> GetAll<'a, T> {
     }
 }
 
-impl<'a, T: PartialEq> PartialEq for GetAll<'a, T> {
+impl<'a, T: Default + PartialEq> PartialEq for GetAll<'a, T> {
     fn eq(&self, other: &Self) -> bool {
         self.values.eq(other.values)
     }
 }
 
-impl<'a, T> IntoIterator for GetAll<'a, T> {
+impl<'a, T: Default> IntoIterator for GetAll<'a, T> {
     type Item = &'a T;
     type IntoIter = ValueIter<'a, T>;
 
@@ -1400,7 +1401,7 @@ impl<'a, T> IntoIterator for GetAll<'a, T> {
     }
 }
 
-impl<'a, 'b: 'a, T> IntoIterator for &'b GetAll<'a, T> {
+impl<'a, 'b: 'a, T: Default> IntoIterator for &'b GetAll<'a, T> {
     type Item = &'a T;
     type IntoIter = ValueIter<'a, T>;
 
@@ -1411,7 +1412,7 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b GetAll<'a, T> {
 
 // ===== impl ValueIter =====
 
-impl<'a, T: 'a> Iterator for ValueIter<'a, T> {
+impl<'a, T: Default + 'a> Iterator for ValueIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1423,17 +1424,17 @@ impl<'a, T: 'a> Iterator for ValueIter<'a, T> {
     }
 }
 
-impl<'a, T: 'a> DoubleEndedIterator for ValueIter<'a, T> {
+impl<'a, T: Default + 'a> DoubleEndedIterator for ValueIter<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
     }
 }
 
-impl<'a, T> FusedIterator for ValueIter<'a, T> {}
+impl<'a, T: Default> FusedIterator for ValueIter<'a, T> {}
 
 // ===== impl ValueIterMut =====
 
-impl<'a, T: 'a> Iterator for ValueIterMut<'a, T> {
+impl<'a, T: Default + 'a> Iterator for ValueIterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1441,17 +1442,17 @@ impl<'a, T: 'a> Iterator for ValueIterMut<'a, T> {
     }
 }
 
-impl<'a, T: 'a> DoubleEndedIterator for ValueIterMut<'a, T> {
+impl<'a, T: Default + 'a> DoubleEndedIterator for ValueIterMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
     }
 }
 
-impl<'a, T> FusedIterator for ValueIterMut<'a, T> {}
+impl<'a, T: Default> FusedIterator for ValueIterMut<'a, T> {}
 
 // ===== impl IntoIter =====
 
-impl<T> Iterator for IntoIter<T> {
+impl<T: Default> Iterator for IntoIter<T> {
     type Item = (Option<HeaderName>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1463,11 +1464,11 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
-impl<T> FusedIterator for IntoIter<T> {}
+impl<T: Default> FusedIterator for IntoIter<T> {}
 
 // ===== impl OccupiedEntry =====
 
-impl<'a, T> OccupiedEntry<'a, T> {
+impl<'a, T: Default> OccupiedEntry<'a, T> {
     /// Returns a reference to the entry's key.
     ///
     /// # Examples
@@ -1583,7 +1584,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert(&mut self, value: T) -> T {
-        self.inner.insert(vec![value]).into_iter().next().unwrap()
+        self.inner.insert(tiny_vec![[T; 1], value]).into_iter().next().unwrap()
     }
 
     /// Sets the value of the entry.
@@ -1609,7 +1610,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert_mult(&mut self, value: T) -> ValueDrain<'_, T> {
-        ValueDrain { inner: self.inner.insert(vec![value]).into_iter(), _marker: PhantomData }
+        ValueDrain { inner: self.inner.insert(tiny_vec![[T; 1], value]).into_iter(), _marker: PhantomData }
     }
 
     /// Insert the value into the entry.
@@ -1757,7 +1758,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     }
 }
 
-impl<'a, T> IntoIterator for OccupiedEntry<'a, T> {
+impl<'a, T: Default> IntoIterator for OccupiedEntry<'a, T> {
     type Item = &'a mut T;
     type IntoIter = ValueIterMut<'a, T>;
 
@@ -1766,7 +1767,7 @@ impl<'a, T> IntoIterator for OccupiedEntry<'a, T> {
     }
 }
 
-impl<'a, 'b: 'a, T> IntoIterator for &'b OccupiedEntry<'a, T> {
+impl<'a, 'b: 'a, T: Default> IntoIterator for &'b OccupiedEntry<'a, T> {
     type Item = &'a T;
     type IntoIter = ValueIter<'a, T>;
 
@@ -1775,7 +1776,7 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b OccupiedEntry<'a, T> {
     }
 }
 
-impl<'a, 'b: 'a, T> IntoIterator for &'b mut OccupiedEntry<'a, T> {
+impl<'a, 'b: 'a, T: Default> IntoIterator for &'b mut OccupiedEntry<'a, T> {
     type Item = &'a mut T;
     type IntoIter = ValueIterMut<'a, T>;
 
@@ -1786,7 +1787,7 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b mut OccupiedEntry<'a, T> {
 
 // ===== impl ValueDrain =====
 
-impl<'a, T> Iterator for ValueDrain<'a, T> {
+impl<'a, T: Default> Iterator for ValueDrain<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -1798,7 +1799,7 @@ impl<'a, T> Iterator for ValueDrain<'a, T> {
     }
 }
 
-impl<'a, T> FusedIterator for ValueDrain<'a, T> {}
+impl<'a, T: Default> FusedIterator for ValueDrain<'a, T> {}
 
 /*
  *

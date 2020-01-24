@@ -748,6 +748,12 @@ impl<'a> PartialOrd<HeaderValue> for &'a str {
     }
 }
 
+impl Default for HeaderValue {
+    fn default() -> Self {
+        HeaderValue::from_static("")
+    }
+}
+
 #[test]
 fn test_try_from() {
     HeaderValue::try_from(vec![127]).unwrap_err();
