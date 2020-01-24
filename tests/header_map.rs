@@ -89,17 +89,28 @@ fn drain() {
     {
         let mut iter = headers.drain();
 
-        let (name, value) = iter.next().unwrap();
-        assert_eq!(name.unwrap().as_str(), "hello");
-        assert_eq!(value, "world");
+        let check_values = |name, value, iter: &mut Drain<HeaderValue>| {
+            match name {
+                "hello" => {
+                    assert_eq!(value, "world");
+
+                    let (name, value) = iter.next().unwrap();
+                    assert_eq!(name, None);
+                    assert_eq!(value, "world2");
+
+                }
+                "zomg" => {
+                    assert_eq!(value, "bar");
+                }
+                name => panic!("unexpected name {}", name),
+            }
+        };
 
         let (name, value) = iter.next().unwrap();
-        assert_eq!(name, None);
-        assert_eq!(value, "world2");
+        check_values(name.as_ref().unwrap().as_str(), value, &mut iter);
 
         let (name, value) = iter.next().unwrap();
-        assert_eq!(name.unwrap().as_str(), "zomg");
-        assert_eq!(value, "bar");
+        check_values(name.as_ref().unwrap().as_str(), value, &mut iter);
 
         assert!(iter.next().is_none());
     }

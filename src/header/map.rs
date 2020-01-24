@@ -618,15 +618,20 @@ impl<T> HeaderMap<T> {
     /// map.append(HOST, "goodbye".parse().unwrap());
     /// map.insert(CONTENT_LENGTH, "123".parse().unwrap());
     ///
-    /// let mut drain = map.drain();
+    /// let mut drain = map.drain().peekable();
     ///
-    ///
-    /// assert_eq!(drain.next(), Some((Some(HOST), "hello".parse().unwrap())));
-    /// assert_eq!(drain.next(), Some((None, "goodbye".parse().unwrap())));
-    ///
-    /// assert_eq!(drain.next(), Some((Some(CONTENT_LENGTH), "123".parse().unwrap())));
-    ///
-    /// assert_eq!(drain.next(), None);
+    /// while let Some((Some(header), _)) = drain.peek() {
+    ///     match header {
+    ///         &HOST => {
+    ///             assert_eq!(drain.next(), Some((Some(HOST), "hello".parse().unwrap())));
+    ///             assert_eq!(drain.next(), Some((None, "goodbye".parse().unwrap())));
+    ///         }
+    ///         &CONTENT_LENGTH => {
+    ///             assert_eq!(drain.next(), Some((Some(CONTENT_LENGTH), "123".parse().unwrap())));
+    ///         }
+    ///         header => panic!("unexpected header {}", header),
+    ///     }
+    /// }
     /// ```
     pub fn drain(&mut self) -> Drain<'_, T> {
         Drain {
@@ -829,10 +834,19 @@ impl<T> IntoIterator for HeaderMap<T> {
     /// map.insert(header::CONTENT_LENGTH, "123".parse().unwrap());
     /// map.insert(header::CONTENT_TYPE, "json".parse().unwrap());
     ///
-    /// let mut iter = map.into_iter();
-    /// assert_eq!(iter.next(), Some((Some(header::CONTENT_LENGTH), "123".parse().unwrap())));
-    /// assert_eq!(iter.next(), Some((Some(header::CONTENT_TYPE), "json".parse().unwrap())));
-    /// assert!(iter.next().is_none());
+    /// let mut iter = map.into_iter().peekable();
+    ///
+    /// while let Some((Some(header), _)) = iter.peek() {
+    ///     match header {
+    ///         &CONTENT_LENGTH => {
+    ///             assert_eq!(iter.next(), Some((Some(header::CONTENT_LENGTH), "123".parse().unwrap())));
+    ///         }
+    ///         &CONTENT_TYPE => {
+    ///             assert_eq!(iter.next(), Some((Some(CONTENT_TYPE), "json".parse().unwrap())));
+    ///         }
+    ///         header => panic!("unexpected header {}", header),
+    ///     }
+    /// }
     /// ```
     ///
     /// Multiple values per key.
@@ -849,15 +863,22 @@ impl<T> IntoIterator for HeaderMap<T> {
     /// map.append(header::CONTENT_TYPE, "html".parse().unwrap());
     /// map.append(header::CONTENT_TYPE, "xml".parse().unwrap());
     ///
-    /// let mut iter = map.into_iter();
+    /// let mut iter = map.into_iter().peekable();
     ///
-    /// assert_eq!(iter.next(), Some((Some(header::CONTENT_LENGTH), "123".parse().unwrap())));
-    /// assert_eq!(iter.next(), Some((None, "456".parse().unwrap())));
-    ///
-    /// assert_eq!(iter.next(), Some((Some(header::CONTENT_TYPE), "json".parse().unwrap())));
-    /// assert_eq!(iter.next(), Some((None, "html".parse().unwrap())));
-    /// assert_eq!(iter.next(), Some((None, "xml".parse().unwrap())));
-    /// assert!(iter.next().is_none());
+    /// while let Some((Some(header), _)) = iter.peek() {
+    ///     match header {
+    ///         &CONTENT_LENGTH => {
+    ///             assert_eq!(iter.next(), Some((Some(header::CONTENT_LENGTH), "123".parse().unwrap())));
+    ///             assert_eq!(iter.next(), Some((None, "456".parse().unwrap())));
+    ///         }
+    ///         &CONTENT_TYPE => {
+    ///             assert_eq!(iter.next(), Some((Some(header::CONTENT_TYPE), "json".parse().unwrap())));
+    ///             assert_eq!(iter.next(), Some((None, "html".parse().unwrap())));
+    ///             assert_eq!(iter.next(), Some((None, "xml".parse().unwrap())));
+    ///         }
+    ///         header => panic!("unexpected header {}", header),
+    ///     }
+    /// }
     /// ```
     fn into_iter(self) -> IntoIter<T> {
         IntoIter {
