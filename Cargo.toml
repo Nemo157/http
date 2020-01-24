@@ -25,6 +25,7 @@ edition = "2018"
 bytes = "0.5"
 fnv = "1.0.5"
 itoa = "0.4.1"
+smallvec = { git = "https://github.com/Nemo157/rust-smallvec", branch = "intoiter-debug" }
 
 [dev-dependencies]
 indexmap = "1.0"

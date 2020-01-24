@@ -2,8 +2,9 @@ use std::collections::{hash_map, HashMap};
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::iter::{self, FromIterator, FusedIterator};
-use std::{fmt, ops, vec, slice};
+use std::{fmt, ops, slice};
 use std::marker::PhantomData;
+use smallvec::{SmallVec, smallvec};
 
 use crate::Error;
 
@@ -42,7 +43,7 @@ pub use self::into_header_name::IntoHeaderName;
 /// ```
 #[derive(Clone)]
 pub struct HeaderMap<T = HeaderValue> {
-    map: HashMap<HeaderName, Vec<T>>,
+    map: HashMap<HeaderName, SmallVec<[T; 1]>>,
 }
 
 /// `HeaderMap` entry iterator.
@@ -51,7 +52,7 @@ pub struct HeaderMap<T = HeaderValue> {
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct Iter<'a, T> {
-    inner: iter::FlatMap<hash_map::Iter<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>, fn((&'a HeaderName, &'a Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>>,
+    inner: iter::FlatMap<hash_map::Iter<'a, HeaderName, SmallVec<[T; 1]>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>, fn((&'a HeaderName, &'a SmallVec<[T; 1]>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::Iter<'a, T>>>,
 }
 
 /// `HeaderMap` mutable entry iterator
@@ -60,7 +61,7 @@ pub struct Iter<'a, T> {
 /// yielded more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct IterMut<'a, T> {
-    inner: iter::FlatMap<hash_map::IterMut<'a, HeaderName, Vec<T>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>, fn((&'a HeaderName, &'a mut Vec<T>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>>,
+    inner: iter::FlatMap<hash_map::IterMut<'a, HeaderName, SmallVec<[T; 1]>>, iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>, fn((&'a HeaderName, &'a mut SmallVec<[T; 1]>)) -> iter::Zip<iter::Repeat<&'a HeaderName>, slice::IterMut<'a, T>>>,
 }
 
 /// An owning iterator over the entries of a `HeaderMap`.
@@ -68,7 +69,7 @@ pub struct IterMut<'a, T> {
 /// This struct is created by the `into_iter` method on `HeaderMap`.
 #[derive(Debug)]
 pub struct IntoIter<T> {
-    inner: iter::FlatMap<hash_map::IntoIter<HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
+    inner: iter::FlatMap<hash_map::IntoIter<HeaderName, SmallVec<[T; 1]>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, smallvec::IntoIter<[T; 1]>>, fn((HeaderName, SmallVec<[T; 1]>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, smallvec::IntoIter<[T; 1]>>>,
 }
 
 /// An iterator over `HeaderMap` keys.
@@ -77,7 +78,7 @@ pub struct IntoIter<T> {
 /// associated value.
 #[derive(Debug)]
 pub struct Keys<'a, T> {
-    inner: hash_map::Keys<'a, HeaderName, Vec<T>>,
+    inner: hash_map::Keys<'a, HeaderName, SmallVec<[T; 1]>>,
 }
 
 /// `HeaderMap` value iterator.
@@ -85,19 +86,19 @@ pub struct Keys<'a, T> {
 /// Each value contained in the `HeaderMap` will be yielded.
 #[derive(Debug)]
 pub struct Values<'a, T> {
-    inner: iter::Flatten<hash_map::Values<'a, HeaderName, Vec<T>>>,
+    inner: iter::Flatten<hash_map::Values<'a, HeaderName, SmallVec<[T; 1]>>>,
 }
 
 /// `HeaderMap` mutable value iterator
 #[derive(Debug)]
 pub struct ValuesMut<'a, T> {
-    inner: iter::Flatten<hash_map::ValuesMut<'a, HeaderName, Vec<T>>>,
+    inner: iter::Flatten<hash_map::ValuesMut<'a, HeaderName, SmallVec<[T; 1]>>>,
 }
 
 /// A drain iterator for `HeaderMap`.
 #[derive(Debug)]
 pub struct Drain<'a, T> {
-    inner: iter::FlatMap<hash_map::Drain<'a, HeaderName, Vec<T>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>, fn((HeaderName, Vec<T>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, vec::IntoIter<T>>>,
+    inner: iter::FlatMap<hash_map::Drain<'a, HeaderName, SmallVec<[T; 1]>>, iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, smallvec::IntoIter<[T; 1]>>, fn((HeaderName, SmallVec<[T; 1]>)) -> iter::Zip<iter::Chain<iter::Once<Option<HeaderName>>, iter::Repeat<Option<HeaderName>>>, smallvec::IntoIter<[T; 1]>>>,
 }
 
 /// A view to all values stored in a single entry.
@@ -123,7 +124,7 @@ pub enum Entry<'a, T: 'a> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct VacantEntry<'a, T> {
-    inner: hash_map::VacantEntry<'a, HeaderName, Vec<T>>,
+    inner: hash_map::VacantEntry<'a, HeaderName, SmallVec<[T; 1]>>,
 }
 
 /// A view into a single occupied location in a `HeaderMap`.
@@ -131,7 +132,7 @@ pub struct VacantEntry<'a, T> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct OccupiedEntry<'a, T> {
-    inner: hash_map::OccupiedEntry<'a, HeaderName, Vec<T>>,
+    inner: hash_map::OccupiedEntry<'a, HeaderName, SmallVec<[T; 1]>>,
     index: usize,
 }
 
@@ -150,7 +151,7 @@ pub struct ValueIterMut<'a, T> {
 /// An drain iterator of all values associated with a single header name.
 #[derive(Debug)]
 pub struct ValueDrain<'a, T> {
-    inner: vec::IntoIter<T>,
+    inner: smallvec::IntoIter<[T; 1]>,
     _marker: PhantomData<&'a mut HeaderMap>,
 }
 
@@ -720,7 +721,7 @@ impl<T> HeaderMap<T> {
     where
         K: IntoHeaderName,
     {
-        self.map.insert(key.into_header_name(), vec![val]).and_then(|values| values.into_iter().next())
+        self.map.insert(key.into_header_name(), smallvec![val]).and_then(|values| values.into_iter().next())
     }
 
     /// Inserts a key-value pair into the map.
@@ -755,7 +756,7 @@ impl<T> HeaderMap<T> {
     {
         match self.map.entry(key.into_header_name()) {
             hash_map::Entry::Vacant(entry) => {
-                entry.insert(vec![value]);
+                entry.insert(smallvec![value]);
                 false
             }
             hash_map::Entry::Occupied(entry) => {
@@ -990,7 +991,7 @@ impl<T> Extend<(Option<HeaderName>, T)> for HeaderMap<T> {
                     e.insert(val);
                     e.inner.into_mut()
                 }
-                Entry::Vacant(e) => e.inner.insert(vec![val]),
+                Entry::Vacant(e) => e.inner.insert(smallvec![val]),
             };
 
             // As long as `HeaderName` is none, keep inserting the value into
@@ -1332,7 +1333,7 @@ impl<'a, T> VacantEntry<'a, T> {
     /// assert_eq!(map["x-hello"], "world");
     /// ```
     pub fn insert(self, value: T) -> &'a mut T {
-        self.inner.insert(vec![value]).first_mut().unwrap()
+        self.inner.insert(smallvec![value]).first_mut().unwrap()
     }
 
     // /// Insert the value into the entry.
@@ -1354,7 +1355,7 @@ impl<'a, T> VacantEntry<'a, T> {
     // /// assert_eq!(map["x-hello"], "world2");
     // /// ```
     // pub fn insert_entry(self, value: T) -> OccupiedEntry<'a, T> {
-    //     self.inner.insert_entry(vec![value]).map(|inner| OccupiedEntry { inner, index: 0 })
+    //     self.inner.insert_entry(smallvec![value]).map(|inner| OccupiedEntry { inner, index: 0 })
     // }
 }
 
@@ -1583,7 +1584,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert(&mut self, value: T) -> T {
-        self.inner.insert(vec![value]).into_iter().next().unwrap()
+        self.inner.insert(smallvec![value]).into_iter().next().unwrap()
     }
 
     /// Sets the value of the entry.
@@ -1609,7 +1610,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
     /// assert_eq!("earth", map["host"]);
     /// ```
     pub fn insert_mult(&mut self, value: T) -> ValueDrain<'_, T> {
-        ValueDrain { inner: self.inner.insert(vec![value]).into_iter(), _marker: PhantomData }
+        ValueDrain { inner: self.inner.insert(smallvec![value]).into_iter(), _marker: PhantomData }
     }
 
     /// Insert the value into the entry.
